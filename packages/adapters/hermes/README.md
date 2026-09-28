@@ -340,3 +340,33 @@ MIT — see [LICENSE](LICENSE)
 - [Paperclip](https://github.com/paperclipai/paperclip) — The orchestration platform
 - [Nous Research](https://nousresearch.com) — The team behind Hermes
 - [Paperclip Docs](https://docs.paperclip.ing) — Paperclip documentation
+
+### Gateway cancellation and event acceptance
+
+Operator cancellation is observed before dispatch and during create. Ambiguous
+create recovery uses `POST /v1/run-reservations/stop` with the original body,
+session header and idempotency key. A compatible gateway must durably reserve a
+cancelled key before acknowledging an absent run, preventing a delayed create
+from invoking inference. No ambiguous create is automatically re-dispatched.
+Native gateways without this extension return an explicit unknown outcome after
+bounded recovery; a late create ID still triggers stop within the transport's
+60-second lifetime. Unknown outcomes require reconciliation before another run.
+
+Stop acknowledgement is not proof of termination. Final polling must observe a
+terminal run before `stop_confirmed` is true. Queue `timeout` is terminal even
+when the overall adapter timeout is disabled. Terminal SSE is reconciled with a
+bounded final status read to retain output and usage. A missing final status
+returns `hermes_gateway_final_status_unconfirmed`.
+
+Authoritative `event_gap: true`, SSE `compatibility.gap`, cursor rejection, or
+completed polling without terminal event delivery returns a nonzero result.
+Polling output and usage are retained, but polling-only completion does not
+satisfy reconnect acceptance. Temporary disconnects can still reconnect using
+the last event cursor; the box shim owns replay retention and native gaps.
+
+The optional `src/gateway/server/shim-contract.test.ts` tests the real adapter
+against the separately maintained `hexorx/mindi` shim and a fake native backend.
+Set `HERMES_COMPAT_SOURCE` to `apps/agent-box-hermes` in that checkout and install
+its `requirements-test.txt` in the selected Python environment before running
+this package's tests. No model or production endpoint is contacted. Without the
+variable, the three cross-repository contract tests are explicitly skipped.
