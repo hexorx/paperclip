@@ -80,6 +80,125 @@ describe("parseSseFramesForTest", () => {
 });
 
 describe("execute", () => {
+  it("does not dispatch an already-cancelled run", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key" });
+    ctx.signal = controller.signal;
+    ctx.onDispatch = vi.fn();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await execute(ctx)).toMatchObject({
+      errorCode: "hermes_gateway_cancelled", signal: "SIGTERM", timedOut: false,
+    });
+    expect(ctx.onDispatch).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["create", "events"])("stops exactly once when cancelled during %s and preserves final results", async (phase) => {
+    const controller = new AbortController();
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key" });
+    ctx.signal = controller.signal;
+    const remove = vi.spyOn(controller.signal, "removeEventListener");
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) {
+        if (phase === "create") controller.abort();
+        await Promise.resolve(); // The remote ID arrives after cancellation.
+        expect(init?.signal?.aborted).not.toBe(true);
+        return Response.json({ run_id: "cancel-run" });
+      }
+      if (url.endsWith("/events")) {
+        if (phase === "events") controller.abort();
+        return new Response(sseStream(":"));
+      }
+      if (url.endsWith("/stop")) {
+        expect(init?.signal).toBeDefined();
+        expect(init?.signal?.aborted).toBe(false);
+        return Response.json({ status: "stopping" });
+      }
+      return Response.json({ status: "cancelled", output: "partial secret-key", usage: { input_tokens: 3, output_tokens: 2 } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await execute(ctx);
+    expect(result).toMatchObject({
+      errorCode: "hermes_gateway_cancelled", timedOut: false, signal: "SIGTERM",
+      usage: { inputTokens: 3, outputTokens: 2 },
+    });
+    expect(result.summary).toContain("partial");
+    expect(JSON.stringify(result)).not.toContain("secret-key");
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/stop"))).toHaveLength(1);
+    expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+  });
+
+  it("cleans up the cancellation listener after a failed create", async () => {
+    const controller = new AbortController();
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key" });
+    ctx.signal = controller.signal;
+    const remove = vi.spyOn(controller.signal, "removeEventListener");
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("offline secret-key"); }));
+    const result = await execute(ctx);
+    expect(result.errorCode).toBe("hermes_gateway_connect_failed");
+    expect(JSON.stringify(result)).not.toContain("secret-key");
+    expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
+  });
+
+  it("resumes event delivery with the last processed SSE cursor", async () => {
+    let connections = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) return Response.json({ run_id: "reconnect-run" });
+      if (url.endsWith("/events")) {
+        connections++;
+        if (connections === 1) return new Response(sseStream('id: 1\nevent: message.delta\ndata: {"delta":"a"}\n\n'));
+        expect(init?.headers).toMatchObject({ "Last-Event-ID": "1" });
+        return new Response(sseStream('id: 2\nevent: run.completed\ndata: {"status":"completed","output":"ab"}\n\n'));
+      }
+      return Response.json({ status: "running" });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await execute(makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", eventReconnectMs: 250 }));
+    expect(result.summary).toBe("ab");
+    expect(connections).toBe(2);
+    expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/v1/runs"))).toHaveLength(1);
+  });
+
+  it("bounds a stalled stop, keeps cancellation distinct from timeout, and final-polls", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+        const timeout = new AbortController();
+        setTimeout(() => timeout.abort(), ms);
+        return timeout.signal;
+      });
+      const controller = new AbortController();
+      const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 1 });
+      ctx.signal = controller.signal;
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/v1/runs")) return Response.json({ run_id: "stalled-stop" });
+        if (url.endsWith("/events")) {
+          controller.abort();
+          return new Response(sseStream(":"));
+        }
+        if (url.endsWith("/stop")) {
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new Error("stop stalled secret-key")), { once: true });
+          });
+        }
+        return Response.json({ status: "cancelled", output: "saved" });
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      const execution = execute(ctx);
+      await vi.advanceTimersByTimeAsync(10_001);
+      expect(await execution).toMatchObject({ errorCode: "hermes_gateway_cancelled", timedOut: false, summary: "saved" });
+      expect(fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/stop"))).toHaveLength(1);
+      expect(JSON.stringify(vi.mocked(ctx.onLog).mock.calls)).not.toContain("secret-key");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects remote plain HTTP unless the unsafe dev escape hatch is enabled", async () => {
     const fetchMock = vi.fn(async () => new Response(JSON.stringify({ run_id: "unexpected" }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
