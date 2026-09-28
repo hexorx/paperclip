@@ -53,6 +53,8 @@ type ExecutionState = {
   runId: string;
   outputChunks: string[];
   lastEventName: string | null;
+  eventGap: boolean;
+  eventTerminalSeen: boolean;
   terminal: TerminalState | null;
   resolveTerminal: (state: TerminalState) => void;
   terminalPromise: Promise<TerminalState>;
@@ -83,6 +85,7 @@ const TERMINAL_STATUSES = new Set([
   "canceled",
   "stopped",
   "interrupted",
+  "timeout",
 ]);
 
 const FAILURE_STATUSES = new Set(["failed", "error"]);
@@ -447,6 +450,8 @@ function createExecutionState(runId: string): ExecutionState {
     runId,
     outputChunks: [],
     lastEventName: null,
+    eventGap: false,
+    eventTerminalSeen: false,
     terminal: null,
     resolveTerminal,
     terminalPromise,
@@ -488,6 +493,7 @@ async function handleEvent(
   const record = asRecord(parsed);
   const eventName = eventNameFromData(parsed, frame.event);
   state.lastEventName = eventName;
+  if (eventName === "compatibility.gap" || record?.event_gap === true) state.eventGap = true;
   await ctx.onLog(
     "stdout",
     `[hermes-gateway:event] run=${state.runId} event=${eventName ?? "message"} data=${stringifyForLog(redactForLog(parsed, [], 0, redactText), 8_000)}\n`,
@@ -502,6 +508,7 @@ async function handleEvent(
 
   const status = extractStatus(parsed) ?? (eventName?.startsWith("run.") ? eventName.slice(4) : null);
   if (status && TERMINAL_STATUSES.has(status)) {
+    state.eventTerminalSeen = true;
     markTerminal(state, {
       runId: state.runId,
       status,
@@ -543,6 +550,7 @@ async function pollStatus(input: {
         headers: input.headers,
         signal: input.signal,
       });
+      if (asRecord(status)?.event_gap === true) input.state.eventGap = true;
       const normalized = extractStatus(status);
       if (normalized && TERMINAL_STATUSES.has(normalized)) {
         markTerminal(input.state, {
@@ -577,6 +585,7 @@ async function consumeEvents(input: {
         signal: input.signal,
       });
       if (!response.ok) {
+        if (response.status === 409) input.state.eventGap = true;
         await input.ctx.onLog("stderr", `[hermes-gateway] event stream HTTP ${response.status}; falling back to polling\n`);
         await delay(input.reconnectMs, input.signal);
         continue;
@@ -666,6 +675,7 @@ function extractErrorMessage(value: unknown): string | null {
 }
 
 function terminalResultCode(status: string): { exitCode: number; signal: string | null; errorCode: string | null } {
+  if (status === "timeout") return { exitCode: 1, signal: null, errorCode: "hermes_gateway_timeout" };
   if (status === "completed") return { exitCode: 0, signal: null, errorCode: null };
   if (FAILURE_STATUSES.has(status)) return { exitCode: 1, signal: null, errorCode: "hermes_gateway_run_failed" };
   if (CANCELLED_STATUSES.has(status)) return { exitCode: 1, signal: "SIGTERM", errorCode: "hermes_gateway_cancelled" };
@@ -686,7 +696,10 @@ export function mapFinalResultForTest(input: {
   );
   const sessionId = extractSessionId(payload) ?? input.sessionKey;
   const sessionDisplayId = sessionId ? redactText(sessionId) : null;
-  const mapped = terminalResultCode(input.terminal.status);
+  const eventGap = payload.event_gap === true;
+  const mapped = eventGap
+    ? { exitCode: 1, signal: null, errorCode: "hermes_gateway_event_gap" }
+    : terminalResultCode(input.terminal.status);
   const usage = parseUsage(payload);
   const costUsd = parseCostUsd(payload);
   const errorMessage = mapped.errorCode
@@ -695,7 +708,7 @@ export function mapFinalResultForTest(input: {
   return {
     exitCode: mapped.exitCode,
     signal: mapped.signal,
-    timedOut: false,
+    timedOut: input.terminal.status === "timeout",
     provider: "hermes_gateway",
     model: extractModel(payload),
     ...(mapped.errorCode ? { errorCode: mapped.errorCode } : {}),
@@ -713,6 +726,7 @@ export function mapFinalResultForTest(input: {
     resultJson: {
       run_id: input.terminal.runId,
       status: input.terminal.status,
+      event_gap: eventGap,
       session_id: sessionDisplayId,
       last_event: input.terminal.eventName ?? null,
       output: output ?? "",
@@ -720,6 +734,17 @@ export function mapFinalResultForTest(input: {
       cost_usd: costUsd,
     },
   };
+}
+
+async function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([work, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("Hermes request deadline exceeded")), ms);
+    })]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function stopRun(input: {
@@ -730,11 +755,11 @@ async function stopRun(input: {
   redactText?: TextRedactor;
 }): Promise<Record<string, unknown> | null> {
   try {
-    const stopped = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}/stop`), {
+    const stopped = await bounded(fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}/stop`), {
       method: "POST",
       headers: input.headers,
       signal: AbortSignal.timeout(STOP_GRACE_MS),
-    });
+    }), STOP_GRACE_MS);
     await input.ctx.onLog("stdout", `[hermes-gateway] stop requested for run ${input.runId}\n`);
     return asRecord(stopped);
   } catch (err) {
@@ -752,11 +777,11 @@ async function fetchFinalStatus(input: {
   const deadline = Date.now() + input.deadlineMs;
   while (Date.now() < deadline) {
     try {
-      const status = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}`), {
+      const status = await bounded(fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}`), {
         method: "GET",
         headers: input.headers,
         signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
-      });
+      }), Math.max(1, deadline - Date.now()));
       const record = asRecord(status);
       const normalized = extractStatus(status);
       if (normalized && TERMINAL_STATUSES.has(normalized)) return record;
@@ -897,8 +922,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     errorCode: "hermes_gateway_cancelled",
     errorMessage: "Hermes gateway run cancelled by operator.",
   });
-  // Do not abort an outstanding create: its response identifies the remote
-  // work we must stop. Remember cancellation until that response arrives.
+  // Preserve the late-ID stop path, but bound create and recover through a
+  // durable cancellation reservation. Never retry an ambiguous create.
   if (ctx.signal?.aborted) return cancelledResult();
   let cancel: () => void = () => undefined;
   const cancellation = new Promise<"cancelled">((resolve) => {
@@ -906,7 +931,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
   ctx.signal?.addEventListener("abort", cancel, { once: true });
   let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  let createTimer: ReturnType<typeof setTimeout> | null = null;
+  const createController = new AbortController();
   const controller = new AbortController();
+  const timeoutPromise = new Promise<"timeout">((resolve) => {
+    if (timeoutMs > 0) timeoutTimer = setTimeout(() => resolve("timeout"), timeoutMs);
+  });
+  let interruptedCreate: "cancelled" | "timeout" | "create_failed" | null = null;
+  let reservationStopRequested = false;
   try {
     let runId: string | null = null;
     try {
@@ -915,11 +947,57 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // request can block so continuation gates may release their issue lock.
       if (ctx.signal?.aborted) return cancelledResult();
       ctx.onDispatch?.();
-      const created = await fetchJson(createRunUrl, {
+      const createPromise = fetchJson(createRunUrl, {
         method: "POST",
         headers: runHeaders,
         body: JSON.stringify(body),
+        signal: AbortSignal.any([createController.signal, AbortSignal.timeout(60_000)]),
       });
+      // A request deadline also applies when the overall run deadline is disabled.
+      const first = await Promise.race([
+        createPromise.catch((error: unknown) => ({ createError: error })),
+        cancellation, timeoutPromise,
+        new Promise<"create_deadline">((resolve) => { createTimer = setTimeout(() => resolve("create_deadline"), 30_000); }),
+      ]);
+      if (createTimer) clearTimeout(createTimer);
+      const createError = asRecord(first)?.createError as HermesHttpError | undefined;
+      if (createError?.status && createError.status < 500) return errorResult(createError, redactText);
+      let created: unknown = first;
+      if (first === "cancelled" || first === "timeout" || first === "create_deadline" || asRecord(first)?.createError) {
+        interruptedCreate = first === "cancelled" ? "cancelled" : createError ? "create_failed" : "timeout";
+        // Allow a promptly arriving ID to use the ordinary stop path. This is
+        // bounded even if response headers OR the response body never arrive.
+        created = await bounded(createPromise, 100).catch(() => null);
+        if (!extractRunId(created)) {
+          let reservation: Record<string, unknown> | null = null;
+          try {
+            reservation = asRecord(await bounded(fetchJson(apiUrl(baseUrl, "/v1/run-reservations/stop"), {
+              method: "POST", headers: runHeaders, body: JSON.stringify(body),
+              signal: AbortSignal.timeout(STOP_GRACE_MS),
+            }), STOP_GRACE_MS));
+          } catch { /* Unsupported native gateway or unavailable shim: fail closed. */ }
+          const recoveredId = extractRunId(reservation);
+          if (recoveredId && reservation?.reservation_cancelled === true) {
+            created = reservation;
+            reservationStopRequested = true;
+            createController.abort(); // Durable tombstone/stop intent now owns cleanup.
+          } else {
+            // Keep the late-ID cleanup attached even after bounded recovery
+            // fails. No retry, no claimed stop, and no successful completion.
+            void createPromise.then(async (late) => {
+              const lateId = extractRunId(late);
+              if (lateId) await stopRun({ ctx, baseUrl, headers: eventHeaders, runId: lateId, redactText });
+            }).catch(() => undefined);
+            return {
+              exitCode: 1, signal: ctx.signal?.aborted ? "SIGTERM" : null,
+              timedOut: !ctx.signal?.aborted && (first === "timeout" || first === "create_deadline"), errorCode: "hermes_gateway_create_outcome_unknown",
+              errorMessage: "Create outcome and stop are unconfirmed; reservation recovery required. Do not redispatch." +
+                (createError ? ` ${redactErrorMessage(createError, redactText)}` : ""),
+              resultJson: { status: "unknown", stop_confirmed: false },
+            };
+          }
+        }
+      }
       runId = extractRunId(created);
       if (!runId) {
         return {
@@ -958,50 +1036,60 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       redactText,
     }).catch(() => undefined);
 
-    const timeoutPromise = new Promise<"timeout">((resolve) => {
-      if (timeoutMs <= 0) return;
-      timeoutTimer = setTimeout(() => resolve("timeout"), timeoutMs);
-    });
-
-    const outcome = await Promise.race([cancellation, state.terminalPromise, timeoutPromise]);
+    const outcome = (ctx.signal?.aborted ? "cancelled" : interruptedCreate) ?? await Promise.race([cancellation, state.terminalPromise, timeoutPromise]);
     if (timeoutTimer) clearTimeout(timeoutTimer);
     controller.abort();
 
-    if (outcome === "timeout" || outcome === "cancelled") {
-      await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
+    if (outcome === "timeout" || outcome === "cancelled" || outcome === "create_failed") {
+      if (!reservationStopRequested) await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
       const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
+      if (!finalStatus) {
+        return {
+          exitCode: 1, signal: outcome === "cancelled" ? "SIGTERM" : null,
+          timedOut: outcome === "timeout", errorCode: "hermes_gateway_stop_unconfirmed",
+          errorMessage: "Stop requested but remote termination is unconfirmed; do not redispatch.",
+          resultJson: { run_id: runId, status: "unknown", stop_confirmed: false, event_gap: state.eventGap },
+        };
+      }
+      const mapped = mapFinalResultForTest({
+        terminal: {
+          runId,
+          status: extractStatus(finalStatus) ?? "cancelled",
+          payload: finalStatus ?? {},
+          eventName: state.lastEventName,
+        },
+        outputChunks: state.outputChunks,
+        sessionKey,
+        strategy,
+        redactText,
+      });
+
       if (outcome === "cancelled") {
-        const mapped = mapFinalResultForTest({
-          terminal: {
-            runId,
-            status: extractStatus(finalStatus) ?? "cancelled",
-            payload: finalStatus ?? {},
-            eventName: state.lastEventName,
-          },
-          outputChunks: state.outputChunks,
-          sessionKey,
-          strategy,
-          redactText,
-        });
         return {
           ...mapped,
           ...cancelledResult(),
           resultJson: {
             ...mapped.resultJson,
+            stop_confirmed: true,
+            event_gap: state.eventGap || finalStatus.event_gap === true,
             final_status: redactForLog(finalStatus, [], 0, redactText),
           },
         };
       }
       return {
+        ...mapped,
         exitCode: 1,
         signal: null,
-        timedOut: true,
-        errorCode: "hermes_gateway_timeout",
-        errorMessage: `Hermes gateway run timed out after ${timeoutSec}s.`,
+        timedOut: outcome === "timeout",
+        errorCode: outcome === "timeout" ? "hermes_gateway_timeout" : "hermes_gateway_create_failed",
+        errorMessage: outcome === "timeout" ? "Hermes gateway request or run deadline exceeded." : "Create failed; reservation cancellation confirmed.",
         provider: "hermes_gateway",
         resultJson: {
+          ...mapped.resultJson,
           run_id: runId,
           status: extractStatus(finalStatus) ?? "timeout",
+          event_gap: state.eventGap || finalStatus.event_gap === true,
+          stop_confirmed: true,
           last_event: state.lastEventName,
           final_status: redactForLog(finalStatus, [], 0, redactText),
         },
@@ -1013,16 +1101,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     }
 
-    return mapFinalResultForTest({
-      terminal: outcome,
+    // Terminal SSE can be sparse or race final usage accounting. Always
+    // reconcile against the authoritative status within a finite bound.
+    const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: 1_000 });
+    const payload = { ...outcome.payload, ...finalStatus,
+      event_gap: state.eventGap || outcome.payload?.event_gap === true || finalStatus?.event_gap === true ||
+        (outcome.status === "completed" && !state.eventTerminalSeen) };
+    const result = mapFinalResultForTest({
+      terminal: { ...outcome, status: extractStatus(finalStatus) ?? outcome.status,
+        output: extractOutput(finalStatus) ?? outcome.output, payload },
       outputChunks: state.outputChunks,
       sessionKey,
       strategy,
       redactText,
     });
+    if (!finalStatus) {
+      return { ...result, exitCode: 1, errorCode: "hermes_gateway_final_status_unconfirmed",
+        errorMessage: "Terminal event could not be reconciled with final status within the deadline." };
+    }
+    return result;
   } finally {
     ctx.signal?.removeEventListener("abort", cancel);
     if (timeoutTimer) clearTimeout(timeoutTimer);
+    if (createTimer) clearTimeout(createTimer);
     controller.abort();
   }
 }
