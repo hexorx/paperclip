@@ -29,6 +29,7 @@ import {
 type SessionKeyStrategy = "issue" | "agent" | "run" | "none";
 
 type SseFrame = {
+  id?: string;
   event: string | null;
   data: string;
 };
@@ -419,16 +420,20 @@ export function parseSseFramesForTest(buffer: string): { frames: SseFrame[]; res
     const rawFrame = normalized.slice(offset, idx);
     offset = idx + 2;
     let event: string | null = null;
+    let id: string | undefined;
     const dataLines: string[] = [];
     for (const line of rawFrame.split("\n")) {
       if (!line || line.startsWith(":")) continue;
       if (line.startsWith("event:")) {
         event = line.slice("event:".length).trim();
+      } else if (line.startsWith("id:")) {
+        const value = line.slice(3).trimStart();
+        if (!value.includes("\0")) id = value;
       } else if (line.startsWith("data:")) {
         dataLines.push(line.slice("data:".length).trimStart());
       }
     }
-    if (dataLines.length > 0) frames.push({ event, data: dataLines.join("\n") });
+    if (dataLines.length > 0) frames.push({ event, data: dataLines.join("\n"), ...(id !== undefined ? { id } : {}) });
   }
   return { frames, rest: normalized.slice(offset) };
 }
@@ -510,15 +515,13 @@ async function handleEvent(
 async function delay(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return;
   await new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    signal.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timer);
-        resolve();
-      },
-      { once: true },
-    );
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal.addEventListener("abort", finish, { once: true });
   });
 }
 
@@ -565,11 +568,12 @@ async function consumeEvents(input: {
   reconnectMs: number;
   redactText?: TextRedactor;
 }): Promise<void> {
+  let lastEventId: string | undefined;
   while (!input.signal.aborted && !input.state.terminal) {
     try {
       const response = await fetch(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.state.runId)}/events`), {
         method: "GET",
-        headers: input.headers,
+        headers: { ...input.headers, ...(lastEventId ? { "Last-Event-ID": lastEventId } : {}) },
         signal: input.signal,
       });
       if (!response.ok) {
@@ -585,26 +589,36 @@ async function consumeEvents(input: {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      while (!input.signal.aborted && !input.state.terminal) {
-        const { value, done } = await reader.read();
-        if (done) {
-          if (buffer.trim().length > 0) {
-            const parsed = parseSseFramesForTest(`${buffer}\n\n`);
-            buffer = parsed.rest;
-            for (const frame of parsed.frames) {
-              await handleEvent(input.ctx, input.state, frame, input.redactText);
-              if (input.state.terminal) break;
+      const cancelReader = () => { void reader.cancel().catch(() => undefined); };
+      input.signal.addEventListener("abort", cancelReader, { once: true });
+      try {
+        while (!input.signal.aborted && !input.state.terminal) {
+          const { value, done } = await reader.read();
+          if (done) {
+            if (buffer.trim().length > 0) {
+              const parsed = parseSseFramesForTest(`${buffer}\n\n`);
+              buffer = parsed.rest;
+              for (const frame of parsed.frames) {
+                await handleEvent(input.ctx, input.state, frame, input.redactText);
+                if (frame.id !== undefined) lastEventId = frame.id;
+                if (input.state.terminal) break;
+              }
             }
+            break;
           }
-          break;
+          buffer += decoder.decode(value, { stream: true });
+          const parsed = parseSseFramesForTest(buffer);
+          buffer = parsed.rest;
+          for (const frame of parsed.frames) {
+            await handleEvent(input.ctx, input.state, frame, input.redactText);
+            if (frame.id !== undefined) lastEventId = frame.id;
+            if (input.state.terminal) break;
+          }
         }
-        buffer += decoder.decode(value, { stream: true });
-        const parsed = parseSseFramesForTest(buffer);
-        buffer = parsed.rest;
-        for (const frame of parsed.frames) {
-          await handleEvent(input.ctx, input.state, frame, input.redactText);
-          if (input.state.terminal) break;
-        }
+      } finally {
+        input.signal.removeEventListener("abort", cancelReader);
+        await reader.cancel().catch(() => undefined);
+        reader.releaseLock();
       }
     } catch (err) {
       if (input.signal.aborted || input.state.terminal) return;
@@ -719,6 +733,7 @@ async function stopRun(input: {
     const stopped = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}/stop`), {
       method: "POST",
       headers: input.headers,
+      signal: AbortSignal.timeout(STOP_GRACE_MS),
     });
     await input.ctx.onLog("stdout", `[hermes-gateway] stop requested for run ${input.runId}\n`);
     return asRecord(stopped);
@@ -740,6 +755,7 @@ async function fetchFinalStatus(input: {
       const status = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}`), {
         method: "GET",
         headers: input.headers,
+        signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
       });
       const record = asRecord(status);
       const normalized = extractStatus(status);
@@ -874,94 +890,139 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   await ctx.onLog("stdout", `[hermes-gateway] creating run at ${createRunUrl} (timeout=${timeoutSec}s, session=${strategy})\n`);
   await ctx.onLog("stdout", `[hermes-gateway] request headers (redacted): ${stringifyForLog(redactForLog(runHeaders, [], 0, redactText), 3_000)}\n`);
 
-  let runId: string | null = null;
+  const cancelledResult = (): AdapterExecutionResult => ({
+    exitCode: 1,
+    signal: "SIGTERM",
+    timedOut: false,
+    errorCode: "hermes_gateway_cancelled",
+    errorMessage: "Hermes gateway run cancelled by operator.",
+  });
+  // Do not abort an outstanding create: its response identifies the remote
+  // work we must stop. Remember cancellation until that response arrives.
+  if (ctx.signal?.aborted) return cancelledResult();
+  let cancel: () => void = () => undefined;
+  const cancellation = new Promise<"cancelled">((resolve) => {
+    cancel = () => resolve("cancelled");
+  });
+  ctx.signal?.addEventListener("abort", cancel, { once: true });
+  let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+  const controller = new AbortController();
   try {
-    // This adapter has no local child process, so crossing into the first
-    // remote create request is its dispatch boundary. Report it before the
-    // request can block so continuation gates may release their issue lock.
-    ctx.onDispatch?.();
-    const created = await fetchJson(createRunUrl, {
-      method: "POST",
-      headers: runHeaders,
-      body: JSON.stringify(body),
+    let runId: string | null = null;
+    try {
+      // This adapter has no local child process, so crossing into the first
+      // remote create request is its dispatch boundary. Report it before the
+      // request can block so continuation gates may release their issue lock.
+      if (ctx.signal?.aborted) return cancelledResult();
+      ctx.onDispatch?.();
+      const created = await fetchJson(createRunUrl, {
+        method: "POST",
+        headers: runHeaders,
+        body: JSON.stringify(body),
+      });
+      runId = extractRunId(created);
+      if (!runId) {
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorCode: "hermes_gateway_protocol_error",
+          errorMessage: "Hermes /v1/runs response did not include run_id.",
+          errorMeta: { response: redactForLog(created, [], 0, redactText) as Record<string, unknown> },
+        };
+      }
+    } catch (err) {
+      return errorResult(err, redactText);
+    }
+
+    await ctx.onLog("stdout", `[hermes-gateway] run created: ${runId}\n`);
+
+    const state = createExecutionState(runId);
+    if (ctx.signal?.aborted) cancel();
+    void consumeEvents({
+      ctx,
+      baseUrl,
+      headers: eventHeaders,
+      state,
+      signal: controller.signal,
+      reconnectMs,
+      redactText,
+    }).catch(() => undefined);
+    void pollStatus({
+      ctx,
+      baseUrl,
+      headers: eventHeaders,
+      state,
+      signal: controller.signal,
+      intervalMs: pollIntervalMs,
+      redactText,
+    }).catch(() => undefined);
+
+    const timeoutPromise = new Promise<"timeout">((resolve) => {
+      if (timeoutMs <= 0) return;
+      timeoutTimer = setTimeout(() => resolve("timeout"), timeoutMs);
     });
-    runId = extractRunId(created);
-    if (!runId) {
+
+    const outcome = await Promise.race([cancellation, state.terminalPromise, timeoutPromise]);
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+    controller.abort();
+
+    if (outcome === "timeout" || outcome === "cancelled") {
+      await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
+      const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
+      if (outcome === "cancelled") {
+        const mapped = mapFinalResultForTest({
+          terminal: {
+            runId,
+            status: extractStatus(finalStatus) ?? "cancelled",
+            payload: finalStatus ?? {},
+            eventName: state.lastEventName,
+          },
+          outputChunks: state.outputChunks,
+          sessionKey,
+          strategy,
+          redactText,
+        });
+        return {
+          ...mapped,
+          ...cancelledResult(),
+          resultJson: {
+            ...mapped.resultJson,
+            final_status: redactForLog(finalStatus, [], 0, redactText),
+          },
+        };
+      }
       return {
         exitCode: 1,
         signal: null,
-        timedOut: false,
-        errorCode: "hermes_gateway_protocol_error",
-        errorMessage: "Hermes /v1/runs response did not include run_id.",
-        errorMeta: { response: redactForLog(created, [], 0, redactText) as Record<string, unknown> },
+        timedOut: true,
+        errorCode: "hermes_gateway_timeout",
+        errorMessage: `Hermes gateway run timed out after ${timeoutSec}s.`,
+        provider: "hermes_gateway",
+        resultJson: {
+          run_id: runId,
+          status: extractStatus(finalStatus) ?? "timeout",
+          last_event: state.lastEventName,
+          final_status: redactForLog(finalStatus, [], 0, redactText),
+        },
+        sessionParams: {
+          hermesRunId: runId,
+          strategy,
+        },
+        sessionDisplayId: sessionKey ? redactText(sessionKey) : null,
       };
     }
-  } catch (err) {
-    return errorResult(err, redactText);
+
+    return mapFinalResultForTest({
+      terminal: outcome,
+      outputChunks: state.outputChunks,
+      sessionKey,
+      strategy,
+      redactText,
+    });
+  } finally {
+    ctx.signal?.removeEventListener("abort", cancel);
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+    controller.abort();
   }
-
-  await ctx.onLog("stdout", `[hermes-gateway] run created: ${runId}\n`);
-
-  const state = createExecutionState(runId);
-  const controller = new AbortController();
-  void consumeEvents({
-    ctx,
-    baseUrl,
-    headers: eventHeaders,
-    state,
-    signal: controller.signal,
-    reconnectMs,
-    redactText,
-  }).catch(() => undefined);
-  void pollStatus({
-    ctx,
-    baseUrl,
-    headers: eventHeaders,
-    state,
-    signal: controller.signal,
-    intervalMs: pollIntervalMs,
-    redactText,
-  }).catch(() => undefined);
-
-  let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
-  const timeoutPromise = new Promise<"timeout">((resolve) => {
-    if (timeoutMs <= 0) return;
-    timeoutTimer = setTimeout(() => resolve("timeout"), timeoutMs);
-  });
-
-  const outcome = await Promise.race([state.terminalPromise, timeoutPromise]);
-  if (timeoutTimer) clearTimeout(timeoutTimer);
-  controller.abort();
-
-  if (outcome === "timeout") {
-    await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
-    const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
-    return {
-      exitCode: 1,
-      signal: null,
-      timedOut: true,
-      errorCode: "hermes_gateway_timeout",
-      errorMessage: `Hermes gateway run timed out after ${timeoutSec}s.`,
-      provider: "hermes_gateway",
-      resultJson: {
-        run_id: runId,
-        status: extractStatus(finalStatus) ?? "timeout",
-        last_event: state.lastEventName,
-        final_status: redactForLog(finalStatus, [], 0, redactText),
-      },
-      sessionParams: {
-        hermesRunId: runId,
-        strategy,
-      },
-      sessionDisplayId: sessionKey ? redactText(sessionKey) : null,
-    };
-  }
-
-  return mapFinalResultForTest({
-    terminal: outcome,
-    outputChunks: state.outputChunks,
-    sessionKey,
-    strategy,
-    redactText,
-  });
 }
