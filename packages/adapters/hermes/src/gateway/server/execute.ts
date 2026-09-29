@@ -821,6 +821,26 @@ function errorResult(err: unknown, redactText: TextRedactor = sanitizeSensitiveT
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  const proof = { dispatched: false, terminal: false };
+  const result = await executeGateway(ctx, proof);
+  if (!ctx.signal?.aborted) return result;
+  // The host accepts Stop only after this acknowledgment. A successful stop
+  // request or reservation alone is not terminal proof.
+  const confirmed = !proof.dispatched || proof.terminal;
+  return {
+    ...result,
+    resultJson: {
+      ...result.resultJson,
+      stop_confirmed: confirmed,
+      executionCancellation: { state: confirmed ? "acknowledged" : "requested" },
+    },
+  };
+}
+
+async function executeGateway(
+  ctx: AdapterExecutionContext,
+  proof: { dispatched: boolean; terminal: boolean },
+): Promise<AdapterExecutionResult> {
   const apiBaseUrlValue = asString(ctx.config.apiBaseUrl ?? ctx.config.url, "").trim();
   if (!apiBaseUrlValue) {
     return {
@@ -945,8 +965,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // This adapter has no local child process, so crossing into the first
       // remote create request is its dispatch boundary. Report it before the
       // request can block so continuation gates may release their issue lock.
+      // Install the listener before readiness, then recheck after the host's
+      // registration/earlier-Stop barrier settles. No provider work may precede it.
+      await ctx.onCancellationReady?.();
       if (ctx.signal?.aborted) return cancelledResult();
       ctx.onDispatch?.();
+      if (ctx.signal?.aborted) return cancelledResult();
+      proof.dispatched = true;
       const createPromise = fetchJson(createRunUrl, {
         method: "POST",
         headers: runHeaders,
@@ -1043,6 +1068,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (outcome === "timeout" || outcome === "cancelled" || outcome === "create_failed") {
       if (!reservationStopRequested) await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
       const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
+      proof.terminal = finalStatus !== null;
       if (!finalStatus) {
         return {
           exitCode: 1, signal: outcome === "cancelled" ? "SIGTERM" : null,
@@ -1104,6 +1130,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Terminal SSE can be sparse or race final usage accounting. Always
     // reconcile against the authoritative status within a finite bound.
     const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: 1_000 });
+    proof.terminal = finalStatus !== null;
     const payload = { ...outcome.payload, ...finalStatus,
       event_gap: state.eventGap || outcome.payload?.event_gap === true || finalStatus?.event_gap === true ||
         (outcome.status === "completed" && !state.eventTerminalSeen) };
