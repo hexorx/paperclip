@@ -95,3 +95,10 @@ On failure, stop new dispatch and restore the previous image/configuration.
 If the new upstream base changed the database schema, an image-only rollback
 may be unsafe: use the tested database/data restore plan, with owner approval
 for any operation that can discard new data. Do not delete retained backups.
+
+## CI regression test synchronization (hex.2)
+
+The native-session resumption Sentry assertions drain pending failure reports
+with the existing `waitForPendingRunFailureReports` helper. An unrelated database
+round trip did not await the background report and raced the spy assertion.
+This is test-only; runtime reporting and database schema are unchanged.
