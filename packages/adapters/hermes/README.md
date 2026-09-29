@@ -345,6 +345,10 @@ MIT — see [LICENSE](LICENSE)
 
 The adapter awaits the host's `onCancellationReady` registration before dispatch
 and observes operator cancellation during registration, create and observation.
+Readiness is bounded by cancellation, the run deadline, and a 30-second ceiling
+even when the run deadline is disabled. No dispatch occurs when readiness loses
+that race. The host registration barrier refuses to publish a finished executor,
+including when an earlier Stop settles after readiness has timed out.
 Ambiguous create recovery uses `POST /v1/run-reservations/stop` with the original body,
 session header and idempotency key. A compatible gateway must durably reserve a
 cancelled key before acknowledging an absent run, preventing a delayed create
@@ -367,7 +371,13 @@ Authoritative `event_gap: true`, SSE `compatibility.gap`, cursor rejection, or
 completed polling without terminal event delivery returns a nonzero result.
 Polling output and usage are retained, but polling-only completion does not
 satisfy reconnect acceptance. Temporary disconnects can still reconnect using
-the last event cursor; the box shim owns replay retention and native gaps.
+the last event cursor, including ID-only updates and empty-ID resets; cursor-only
+blocks do not emit application events. The box shim owns replay retention and
+native gaps. Unknown termination takes diagnostic priority over a gap; once
+termination is verified, a gap takes priority over timeout. The secondary
+timeout evidence remains in `resultJson.timed_out`. Gap-primary and
+unconfirmed outcomes set `timedOut: false` so the host does not replace their
+error code with generic timeout.
 
 The optional `src/gateway/server/shim-contract.test.ts` tests the real adapter
 against the separately maintained `hexorx/mindi` shim and a fake native backend.

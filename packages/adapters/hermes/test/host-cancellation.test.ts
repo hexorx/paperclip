@@ -110,6 +110,66 @@ describe("board Stop / Hermes host contract (offline)", () => {
     expect(remove).toHaveBeenCalledWith("abort", expect.any(Function));
   });
 
+  it.each(["abort", "run deadline", "readiness deadline"] as const)(
+    "bounds never-settling readiness on %s without dispatch", async (cause) => {
+      vi.useFakeTimers();
+      const h = host();
+      const abort = new AbortController();
+      h.ctx.signal = abort.signal;
+      h.ctx.config.timeoutSec = cause === "run deadline" ? 0.001 : 0;
+      const gate = deferred();
+      h.ctx.onCancellationReady = () => gate.promise;
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      const execution = h.start();
+      await vi.advanceTimersByTimeAsync(0);
+      if (cause === "abort") abort.abort();
+      await vi.advanceTimersByTimeAsync(cause === "readiness deadline" ? 30_001 : 2);
+      expect(await execution).toMatchObject({
+        exitCode: 1, timedOut: cause !== "abort",
+        errorCode: cause === "abort" ? "hermes_gateway_cancelled" : "hermes_gateway_readiness_timeout",
+      });
+      gate.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(h.ctx.onDispatch).not.toHaveBeenCalled();
+      expect(adapterExecutionControls.has(h.ctx.runId)).toBe(false);
+    },
+  );
+
+  it("does not republish ownership when an earlier Stop settles after readiness times out", async () => {
+    vi.useFakeTimers();
+    const h = host();
+    const persisted = deferred();
+    const stop = h.stop(persisted.promise);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const execution = h.start();
+    await vi.advanceTimersByTimeAsync(30_001);
+    expect(await execution).toMatchObject({ errorCode: "hermes_gateway_readiness_timeout" });
+    persisted.resolve();
+    await stop;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(adapterExecutionControls.has(h.ctx.runId)).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("observes a late readiness rejection after returning", async () => {
+    vi.useFakeTimers();
+    const h = host();
+    let reject!: (error: Error) => void;
+    h.ctx.onCancellationReady = () => new Promise<void>((_, fail) => { reject = fail; });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const execution = h.start();
+    await vi.advanceTimersByTimeAsync(30_001);
+    expect(await execution).toMatchObject({ errorCode: "hermes_gateway_readiness_timeout" });
+    reject(new Error("late registration failure"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(adapterExecutionControls.has(h.ctx.runId)).toBe(false);
+  });
+
   it("rechecks Stop synchronously raised by the dispatch callback", async () => {
     const h = host();
     let stop!: Promise<void>;
