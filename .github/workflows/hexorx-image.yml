@@ -1,0 +1,186 @@
+name: Hexorx release image
+
+on:
+  pull_request:
+    branches: [hexorx]
+  push:
+    branches: [hexorx]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hexorx-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/hexorx' }}
+
+jobs:
+  verify:
+    if: github.repository == 'hexorx/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: pnpm install --frozen-lockfile
+      # The upstream root Vitest project list does not include Hermes.
+      - run: pnpm --filter @paperclipai/hermes-paperclip-adapter test
+      - run: pnpm --filter @paperclipai/hermes-paperclip-adapter typecheck
+      - run: pnpm --filter @paperclipai/hermes-paperclip-adapter build
+      - run: git diff --exit-code
+
+  workspace:
+    if: github.repository == 'hexorx/paperclip'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: pnpm install --frozen-lockfile
+      - name: Install the repository-pinned Rust toolchain
+        working-directory: packages/paperclip-runner
+        run: rustup show
+      - run: pnpm -r typecheck
+      - run: pnpm build
+
+  tests:
+    if: github.repository == 'hexorx/paperclip'
+    name: tests (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: general-server-1
+            args: --mode general --group general-server --shard-index 0 --shard-count 5
+          - label: general-server-2
+            args: --mode general --group general-server --shard-index 1 --shard-count 5
+          - label: general-server-3
+            args: --mode general --group general-server --shard-index 2 --shard-count 5
+          - label: general-server-4
+            args: --mode general --group general-server --shard-index 3 --shard-count 5
+          - label: general-server-5
+            args: --mode general --group general-server --shard-index 4 --shard-count 5
+          - label: general-workspaces-a-1
+            args: --mode general --group general-workspaces-a --shard-index 0 --shard-count 2
+          - label: general-workspaces-a-2
+            args: --mode general --group general-workspaces-a --shard-index 1 --shard-count 2
+          - label: general-workspaces-b-1
+            args: --mode general --group general-workspaces-b
+          - label: serialized-1
+            args: --mode serialized --shard-index 0 --shard-count 5
+          - label: serialized-2
+            args: --mode serialized --shard-index 1 --shard-count 5
+          - label: serialized-3
+            args: --mode serialized --shard-index 2 --shard-count 5
+          - label: serialized-4
+            args: --mode serialized --shard-index 3 --shard-count 5
+          - label: serialized-5
+            args: --mode serialized --shard-index 4 --shard-count 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 9.15.4
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: pnpm install --frozen-lockfile
+      # Use upstream's test partitioner; all general and serialized suites remain required.
+      - run: pnpm run preflight:workspace-links
+      - run: pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+      - run: node scripts/run-vitest-stable.mjs ${{ matrix.args }}
+
+  image:
+    needs: [verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Read version
+        id: version
+        run: |
+          version="$(cat .hexorx-version)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-hex\.[0-9]+$ ]]
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - name: Build production image without publishing
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: production
+          platforms: linux/amd64
+          push: false
+          build-args: |
+            PAPERCLIP_BUILD_VERSION=${{ steps.version.outputs.value }}
+            PAPERCLIP_BUILD_COMMIT=${{ github.event.pull_request.head.sha || github.sha }}
+
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/hexorx' && github.repository == 'hexorx/paperclip'
+    needs: [verify, workspace, tests, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Read version
+        id: version
+        run: echo "value=$(cat .hexorx-version)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish reviewed production image
+        id: publish
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: production
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/hexorx/paperclip:${{ steps.version.outputs.value }}
+            ghcr.io/hexorx/paperclip:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/hexorx/paperclip
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.value }}
+          build-args: |
+            PAPERCLIP_BUILD_VERSION=${{ steps.version.outputs.value }}
+            PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
+      - name: Record immutable image
+        env:
+          IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+          IMAGE_VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          echo "Image: ghcr.io/hexorx/paperclip:$IMAGE_VERSION" >> "$GITHUB_STEP_SUMMARY"
+          echo "Digest: ghcr.io/hexorx/paperclip@$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
