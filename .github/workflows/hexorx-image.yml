@@ -4,14 +4,14 @@ on:
   pull_request:
     branches: [hexorx]
   push:
-    branches: [hexorx, feat/hexorx-release-image]
+    branches: [hexorx]
 
 permissions:
   contents: read
 
 concurrency:
   group: hexorx-image-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.ref != 'refs/heads/hexorx' }}
 
 jobs:
   verify:
