@@ -2813,7 +2813,7 @@ export function agentRoutes(
     );
   }
 
-  async function assertCanResumeAgent(
+  async function assertCanPauseOrResumeAgent(
     req: Request,
     targetAgent: { id: string; companyId: string },
   ) {
@@ -5352,11 +5352,12 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/pause", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
-    if (!(await getAccessibleAgent(req, res, id))) {
+    const existing = await getAccessibleAgent(req, res, id);
+    if (!existing) {
       return;
     }
+    await assertCanPauseOrResumeAgent(req, existing);
     const agent = await svc.pause(id);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
@@ -5365,10 +5366,14 @@ export function agentRoutes(
 
     await heartbeat.cancelActiveForAgent(id);
 
+    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      runId: actor.runId,
+      agentApiKeyId: actor.agentApiKeyId,
       action: "agent.paused",
       entityType: "agent",
       entityId: agent.id,
@@ -5383,7 +5388,7 @@ export function agentRoutes(
     if (!existing) {
       return;
     }
-    await assertCanResumeAgent(req, existing);
+    await assertCanPauseOrResumeAgent(req, existing);
     if (existing.orgChainHealth?.status === "invalid_org_chain") {
       res.status(409).json({
         error: existing.orgChainHealth?.repairGuidance ?? "Repair this agent's reporting chain before resuming it",

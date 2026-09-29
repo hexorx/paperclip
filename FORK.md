@@ -22,6 +22,14 @@ We carry the seven commits from upstream
 
 The upstream PR stays open. This fork does not wait for its merge or release.
 Fork-only files are this document, `.hexorx-version`, and the image workflow.
+
+Release `2026.916.1-hex.2` also carries the agent pause authorization patch:
+`POST /agents/:id/pause` uses the same `agent_config:update` decision with
+`requiresChangeGrant` as resume. Board access and company isolation remain intact.
+Pause activity records the actual actor, agent, run, and API key. Route tests
+cover granted and denied agents, board access, tenant isolation, cancellation,
+and audit attribution. This patch changes no database schema or migrations;
+rollback to `2026.916.1-hex.1` is image-only.
 The upstream PR workflow is skipped in this fork in favor of the fork workflow.
 The upstream commitperclip bot workflow is upstream-only; it requires upstream
 bot credentials and dependency-graph configuration. It is disabled in the fork
@@ -87,3 +95,10 @@ On failure, stop new dispatch and restore the previous image/configuration.
 If the new upstream base changed the database schema, an image-only rollback
 may be unsafe: use the tested database/data restore plan, with owner approval
 for any operation that can discard new data. Do not delete retained backups.
+
+## CI regression test synchronization (hex.2)
+
+The native-session resumption Sentry assertions drain pending failure reports
+with the existing `waitForPendingRunFailureReports` helper. An unrelated database
+round trip did not await the background report and raced the spy assertion.
+This is test-only; runtime reporting and database schema are unchanged.
