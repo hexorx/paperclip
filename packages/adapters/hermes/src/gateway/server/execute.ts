@@ -31,7 +31,7 @@ type SessionKeyStrategy = "issue" | "agent" | "run" | "none";
 type SseFrame = {
   id?: string;
   event: string | null;
-  data: string;
+  data?: string;
 };
 
 type HermesHttpError = Error & {
@@ -436,7 +436,9 @@ export function parseSseFramesForTest(buffer: string): { frames: SseFrame[]; res
         dataLines.push(line.slice("data:".length).trimStart());
       }
     }
-    if (dataLines.length > 0) frames.push({ event, data: dataLines.join("\n"), ...(id !== undefined ? { id } : {}) });
+    if (dataLines.length > 0 || id !== undefined) {
+      frames.push({ event, ...(dataLines.length > 0 ? { data: dataLines.join("\n") } : {}), ...(id !== undefined ? { id } : {}) });
+    }
   }
   return { frames, rest: normalized.slice(offset) };
 }
@@ -489,6 +491,8 @@ async function handleEvent(
   frame: SseFrame,
   redactText: TextRedactor = sanitizeSensitiveText,
 ): Promise<void> {
+  // Cursor-only blocks update reconnect state without dispatching an event.
+  if (frame.data === undefined) return;
   const parsed = parseJsonData(frame.data);
   const record = asRecord(parsed);
   const eventName = eventNameFromData(parsed, frame.event);
@@ -708,7 +712,7 @@ export function mapFinalResultForTest(input: {
   return {
     exitCode: mapped.exitCode,
     signal: mapped.signal,
-    timedOut: input.terminal.status === "timeout",
+    timedOut: !eventGap && input.terminal.status === "timeout",
     provider: "hermes_gateway",
     model: extractModel(payload),
     ...(mapped.errorCode ? { errorCode: mapped.errorCode } : {}),
@@ -727,6 +731,7 @@ export function mapFinalResultForTest(input: {
       run_id: input.terminal.runId,
       status: input.terminal.status,
       event_gap: eventGap,
+      timed_out: input.terminal.status === "timeout",
       session_id: sessionDisplayId,
       last_event: input.terminal.eventName ?? null,
       output: output ?? "",
@@ -952,6 +957,7 @@ async function executeGateway(
   ctx.signal?.addEventListener("abort", cancel, { once: true });
   let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
   let createTimer: ReturnType<typeof setTimeout> | null = null;
+  let readinessTimer: ReturnType<typeof setTimeout> | null = null;
   const createController = new AbortController();
   const controller = new AbortController();
   const timeoutPromise = new Promise<"timeout">((resolve) => {
@@ -967,7 +973,24 @@ async function executeGateway(
       // request can block so continuation gates may release their issue lock.
       // Install the listener before readiness, then recheck after the host's
       // registration/earlier-Stop barrier settles. No provider work may precede it.
-      await ctx.onCancellationReady?.();
+      const readiness = await Promise.race([
+        Promise.resolve().then(() => ctx.onCancellationReady?.()).then(() => "ready" as const),
+        cancellation,
+        timeoutPromise,
+        new Promise<"readiness_deadline">((resolve) => {
+          readinessTimer = setTimeout(() => resolve("readiness_deadline"), 30_000);
+        }),
+      ]);
+      if (readinessTimer) clearTimeout(readinessTimer);
+      if (readiness === "cancelled") return cancelledResult();
+      if (readiness !== "ready") {
+        return {
+          exitCode: 1, signal: null, timedOut: true,
+          errorCode: "hermes_gateway_readiness_timeout",
+          errorMessage: "Cancellation readiness deadline exceeded before provider dispatch.",
+          resultJson: { status: "timeout", dispatched: false },
+        };
+      }
       if (ctx.signal?.aborted) return cancelledResult();
       ctx.onDispatch?.();
       if (ctx.signal?.aborted) return cancelledResult();
@@ -1015,10 +1038,10 @@ async function executeGateway(
             }).catch(() => undefined);
             return {
               exitCode: 1, signal: ctx.signal?.aborted ? "SIGTERM" : null,
-              timedOut: !ctx.signal?.aborted && (first === "timeout" || first === "create_deadline"), errorCode: "hermes_gateway_create_outcome_unknown",
+              timedOut: false, errorCode: "hermes_gateway_create_outcome_unknown",
               errorMessage: "Create outcome and stop are unconfirmed; reservation recovery required. Do not redispatch." +
                 (createError ? ` ${redactErrorMessage(createError, redactText)}` : ""),
-              resultJson: { status: "unknown", stop_confirmed: false },
+              resultJson: { status: "unknown", stop_confirmed: false, timed_out: first === "timeout" || first === "create_deadline" },
             };
           }
         }
@@ -1072,16 +1095,16 @@ async function executeGateway(
       if (!finalStatus) {
         return {
           exitCode: 1, signal: outcome === "cancelled" ? "SIGTERM" : null,
-          timedOut: outcome === "timeout", errorCode: "hermes_gateway_stop_unconfirmed",
+          timedOut: false, errorCode: "hermes_gateway_stop_unconfirmed",
           errorMessage: "Stop requested but remote termination is unconfirmed; do not redispatch.",
-          resultJson: { run_id: runId, status: "unknown", stop_confirmed: false, event_gap: state.eventGap },
+          resultJson: { run_id: runId, status: "unknown", stop_confirmed: false, event_gap: state.eventGap, timed_out: outcome === "timeout" },
         };
       }
       const mapped = mapFinalResultForTest({
         terminal: {
           runId,
           status: extractStatus(finalStatus) ?? "cancelled",
-          payload: finalStatus ?? {},
+          payload: { ...finalStatus, event_gap: state.eventGap || finalStatus.event_gap === true },
           eventName: state.lastEventName,
         },
         outputChunks: state.outputChunks,
@@ -1090,6 +1113,16 @@ async function executeGateway(
         redactText,
       });
 
+      if (mapped.errorCode === "hermes_gateway_event_gap") {
+        return {
+          ...mapped,
+          timedOut: false,
+          resultJson: { ...mapped.resultJson, stop_confirmed: true,
+            timed_out: outcome === "timeout" || extractStatus(finalStatus) === "timeout",
+            cancelled: outcome === "cancelled",
+            final_status: redactForLog(finalStatus, [], 0, redactText) },
+        };
+      }
       if (outcome === "cancelled") {
         return {
           ...mapped,
@@ -1143,7 +1176,7 @@ async function executeGateway(
       redactText,
     });
     if (!finalStatus) {
-      return { ...result, exitCode: 1, errorCode: "hermes_gateway_final_status_unconfirmed",
+      return { ...result, exitCode: 1, timedOut: false, errorCode: "hermes_gateway_final_status_unconfirmed",
         errorMessage: "Terminal event could not be reconciled with final status within the deadline." };
     }
     return result;
@@ -1151,6 +1184,7 @@ async function executeGateway(
     ctx.signal?.removeEventListener("abort", cancel);
     if (timeoutTimer) clearTimeout(timeoutTimer);
     if (createTimer) clearTimeout(createTimer);
+    if (readinessTimer) clearTimeout(readinessTimer);
     controller.abort();
   }
 }
