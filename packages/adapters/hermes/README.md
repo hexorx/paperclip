@@ -343,8 +343,9 @@ MIT — see [LICENSE](LICENSE)
 
 ### Gateway cancellation and event acceptance
 
-Operator cancellation is observed before dispatch and during create. Ambiguous
-create recovery uses `POST /v1/run-reservations/stop` with the original body,
+The adapter awaits the host's `onCancellationReady` registration before dispatch
+and observes operator cancellation during registration, create and observation.
+Ambiguous create recovery uses `POST /v1/run-reservations/stop` with the original body,
 session header and idempotency key. A compatible gateway must durably reserve a
 cancelled key before acknowledging an absent run, preventing a delayed create
 from invoking inference. No ambiguous create is automatically re-dispatched.
@@ -352,8 +353,12 @@ Native gateways without this extension return an explicit unknown outcome after
 bounded recovery; a late create ID still triggers stop within the transport's
 60-second lifetime. Unknown outcomes require reconciliation before another run.
 
-Stop acknowledgement is not proof of termination. Final polling must observe a
-terminal run before `stop_confirmed` is true. Queue `timeout` is terminal even
+A stop endpoint acknowledgment is not proof of termination. The host-facing
+`resultJson.executionCancellation.state` is `acknowledged` only after proven no
+dispatch or a terminal status read; ambiguous creates and unconfirmed termination
+remain `requested`. A Stop racing final reconciliation follows the same rule.
+For a dispatched run, final polling must observe a terminal run before
+`stop_confirmed` is true. Queue `timeout` is terminal even
 when the overall adapter timeout is disabled. Terminal SSE is reconciled with a
 bounded final status read to retain output and usage. A missing final status
 returns `hermes_gateway_final_status_unconfirmed`.
@@ -369,4 +374,11 @@ against the separately maintained `hexorx/mindi` shim and a fake native backend.
 Set `HERMES_COMPAT_SOURCE` to `apps/agent-box-hermes` in that checkout and install
 its `requirements-test.txt` in the selected Python environment before running
 this package's tests. No model or production endpoint is contacted. Without the
-variable, the three cross-repository contract tests are explicitly skipped.
+variable, the four cross-repository contract tests are explicitly skipped.
+
+The always-on `test/host-cancellation.test.ts` uses the production host Stop
+ownership and registration barriers with in-memory persistence and fake HTTP.
+It covers Stop before create, registration races, stalled create headers/body,
+observation, and terminal reconciliation. It checks the host acknowledgment
+contract for both proven termination and outcomes that remain unconfirmed.
+It is an offline contract test, not a board UI or database integration test.
