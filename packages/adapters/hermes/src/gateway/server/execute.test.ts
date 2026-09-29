@@ -1027,7 +1027,13 @@ describe("review regressions", () => {
     expect(second.frames).toEqual([{ event: null, id: "" }]);
   });
 
-  it("reconnects with an ID-only cursor and clears it on an empty-ID-only block", async () => {
+  it.each([
+    ["id: B", "B", "id:"],
+    ["id: B", "B", "id"],
+    ["id:  B", " B", "id"],
+    ["id:\tB", "\tB", "id"],
+    ["id: B:C ", "B:C ", "id:"],
+  ])("reconnects with exact cursor %j and resets with %j (%j)", async (cursorLine, cursor, resetLine) => {
     vi.useFakeTimers();
     let connections = 0;
     const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 0, eventReconnectMs: 250 });
@@ -1036,10 +1042,10 @@ describe("review regressions", () => {
       if (url.endsWith("/v1/runs")) return Response.json({ run_id: "cursor-run" });
       if (url.endsWith("/events")) {
         connections++;
-        if (connections === 1) return new Response(sseStream('id: A\ndata: {"delta":"a"}\n\nid: B\n\n'));
+        if (connections === 1) return new Response(sseStream('id: A\ndata: {"delta":"a"}\n\n' + cursorLine + "\n\n"));
         if (connections === 2) {
-          expect(init?.headers).toMatchObject({ "Last-Event-ID": "B" });
-          return new Response(sseStream("id:\n\n"));
+          expect(init?.headers).toMatchObject({ "Last-Event-ID": cursor });
+          return new Response(sseStream(resetLine + "\n\n"));
         }
         expect(init?.headers).not.toHaveProperty("Last-Event-ID");
         return new Response(sseStream('event: run.completed\ndata: {"status":"completed"}\n\n'));

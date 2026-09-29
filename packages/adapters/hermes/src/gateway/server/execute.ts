@@ -427,13 +427,16 @@ export function parseSseFramesForTest(buffer: string): { frames: SseFrame[]; res
     const dataLines: string[] = [];
     for (const line of rawFrame.split("\n")) {
       if (!line || line.startsWith(":")) continue;
-      if (line.startsWith("event:")) {
-        event = line.slice("event:".length).trim();
-      } else if (line.startsWith("id:")) {
-        const value = line.slice(3).trimStart();
+      const colon = line.indexOf(":");
+      const field = colon < 0 ? line : line.slice(0, colon);
+      let value = colon < 0 ? "" : line.slice(colon + 1);
+      if (value.startsWith(" ")) value = value.slice(1);
+      if (field === "event") {
+        event = value;
+      } else if (field === "id") {
         if (!value.includes("\0")) id = value;
-      } else if (line.startsWith("data:")) {
-        dataLines.push(line.slice("data:".length).trimStart());
+      } else if (field === "data") {
+        dataLines.push(value);
       }
     }
     if (dataLines.length > 0 || id !== undefined) {
