@@ -1030,9 +1030,7 @@ describe("review regressions", () => {
   it.each([
     ["id: B", "B", "id:"],
     ["id: B", "B", "id"],
-    ["id:  B", " B", "id"],
-    ["id:\tB", "\tB", "id"],
-    ["id: B:C ", "B:C ", "id:"],
+    ["id: B:C", "B:C", "id:"],
   ])("reconnects with exact cursor %j and resets with %j (%j)", async (cursorLine, cursor, resetLine) => {
     vi.useFakeTimers();
     let connections = 0;
@@ -1044,7 +1042,7 @@ describe("review regressions", () => {
         connections++;
         if (connections === 1) return new Response(sseStream('id: A\ndata: {"delta":"a"}\n\n' + cursorLine + "\n\n"));
         if (connections === 2) {
-          expect(init?.headers).toMatchObject({ "Last-Event-ID": cursor });
+          expect(new Headers(init?.headers).get("Last-Event-ID")).toBe(cursor);
           return new Response(sseStream(resetLine + "\n\n"));
         }
         expect(init?.headers).not.toHaveProperty("Last-Event-ID");
@@ -1058,6 +1056,30 @@ describe("review regressions", () => {
     expect(connections).toBe(3);
     const eventLogs = vi.mocked(ctx.onLog).mock.calls.filter(([, line]) => line.includes("[hermes-gateway:event]"));
     expect(eventLogs).toHaveLength(2);
+  });
+
+  it.each([" B", "\tB", "B:C ", "B\rC", "雪"])("fails closed before reconnecting with unrepresentable cursor %j", async (cursor) => {
+    vi.useFakeTimers();
+    // Exercise the real Fetch header boundary, not just a raw init object.
+    try {
+      expect(new Request("http://127.0.0.1/events", { headers: { "Last-Event-ID": cursor } }).headers.get("Last-Event-ID")).not.toBe(cursor);
+    } catch (err) { expect(err).toBeInstanceOf(TypeError); }
+    let connections = 0;
+    const ctx = makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 0, eventReconnectMs: 250 });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      if (request.url.endsWith("/v1/runs")) return Response.json({ run_id: "cursor-gap" });
+      if (request.url.endsWith("/events")) {
+        connections++;
+        return new Response(sseStream("id: " + cursor + "\n\n"));
+      }
+      return Response.json({ status: "completed", output: "retained" });
+    }));
+    const execution = execute(ctx);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(await execution).toMatchObject({ exitCode: 1, errorCode: "hermes_gateway_event_gap", summary: "retained", resultJson: { event_gap: true } });
+    expect(connections).toBe(1);
+    expect(vi.mocked(ctx.onLog).mock.calls.some(([, line]) => line.includes("cannot survive HTTP header transport unchanged"))).toBe(true);
   });
 
   it("keeps a gateway terminal timeout secondary to an event gap", () => {

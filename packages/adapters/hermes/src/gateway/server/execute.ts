@@ -585,6 +585,19 @@ async function consumeEvents(input: {
 }): Promise<void> {
   let lastEventId: string | undefined;
   while (!input.signal.aborted && !input.state.terminal) {
+    // Fetch normalizes header whitespace and rejects some SSE-valid IDs. Never
+    // resume at a substituted opaque cursor: keep polling, but reject success.
+    if (lastEventId) {
+      let transportCursor: string | null = null;
+      try {
+        transportCursor = new Headers({ "Last-Event-ID": lastEventId }).get("Last-Event-ID");
+      } catch { /* An unrepresentable cursor is also an event gap. */ }
+      if (transportCursor !== lastEventId) {
+        input.state.eventGap = true;
+        await input.ctx.onLog("stderr", "[hermes-gateway] event cursor cannot survive HTTP header transport unchanged; event gap, falling back to polling\n");
+        return;
+      }
+    }
     try {
       const response = await fetch(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.state.runId)}/events`), {
         method: "GET",
