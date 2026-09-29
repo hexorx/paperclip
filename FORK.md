@@ -23,6 +23,11 @@ We carry the seven commits from upstream
 The upstream PR stays open. This fork does not wait for its merge or release.
 Fork-only files are this document, `.hexorx-version`, and the image workflow.
 The upstream PR workflow is skipped in this fork in favor of the fork workflow.
+The upstream commitperclip bot workflow is upstream-only; it requires upstream
+bot credentials and dependency-graph configuration. It is disabled in the fork
+settings during bootstrap because `pull_request_target` reads the base workflow.
+Independent human/agent review remains required. Re-enable it only after a
+reviewed fork-compatible configuration is available.
 No database schema changes are part of the backport.
 
 ## Build and publication
