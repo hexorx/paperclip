@@ -25,6 +25,7 @@ import {
   isPaperclipRecoveryWakePayload,
   renderTemplate,
   stringifyPaperclipWakePayload,
+  boundPaperclipWakePayloadEnv,
 } from "@paperclipai/adapter-utils/server-utils";
 
 type CursorCloudSession = {
@@ -133,7 +134,7 @@ function buildWakeEnv(ctx: AdapterExecutionContext, configEnv: Record<string, st
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
+  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = boundPaperclipWakePayloadEnv(wakePayloadJson);
   if (issueWorkMode) env.PAPERCLIP_ISSUE_WORK_MODE = issueWorkMode;
   if (authToken) {
     env.PAPERCLIP_API_KEY = authToken;

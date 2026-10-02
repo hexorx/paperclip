@@ -73,6 +73,7 @@ import {
   rewriteWorkspaceCwdEnvVarsForExecution,
   shapePaperclipWorkspaceEnvForExecution,
   stringifyPaperclipWakePayload,
+  boundPaperclipWakePayloadEnv,
   type PaperclipSkillEntry,
 } from "@paperclipai/adapter-utils/server-utils";
 import { shellQuote } from "@paperclipai/adapter-utils/ssh";
@@ -1921,7 +1922,7 @@ async function buildRuntime(input: {
   if (approvalId) env.PAPERCLIP_APPROVAL_ID = approvalId;
   if (approvalStatus) env.PAPERCLIP_APPROVAL_STATUS = approvalStatus;
   if (linkedIssueIds.length > 0) env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
+  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = boundPaperclipWakePayloadEnv(wakePayloadJson);
   applyPaperclipWorkspaceEnv(env, {
     workspaceCwd: shapedWorkspaceEnv.workspaceCwd,
     workspaceSource,
@@ -2642,6 +2643,9 @@ function resolveRuntimeEnv(
     !finalEnv.DEFAULT_AUTH_REQUEST
   ) {
     finalEnv.DEFAULT_AUTH_REQUEST = JSON.stringify({ methodId: "api-key" });
+  }
+  if (finalEnv.PAPERCLIP_WAKE_PAYLOAD_JSON) {
+    finalEnv.PAPERCLIP_WAKE_PAYLOAD_JSON = boundPaperclipWakePayloadEnv(finalEnv.PAPERCLIP_WAKE_PAYLOAD_JSON);
   }
   return finalEnv;
 }

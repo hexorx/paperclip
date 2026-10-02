@@ -1915,6 +1915,33 @@ export function normalizePaperclipWakePayload(
   };
 }
 
+// Includes the environment key, equals sign, and terminating NUL. Keep well
+// below Linux's per-string exec limit, including on small-page systems.
+export const PAPERCLIP_WAKE_ENV_MAX_BYTES = 32 * 1024;
+const PAPERCLIP_WAKE_ENV_OVERHEAD = Buffer.byteLength("PAPERCLIP_WAKE_PAYLOAD_JSON=") + 1;
+
+/** Bound only the environment transport. Prompt/API snapshots stay complete. */
+export function boundPaperclipWakePayloadEnv(json: string): string {
+  if (Buffer.byteLength(json, "utf8") + PAPERCLIP_WAKE_ENV_OVERHEAD <= PAPERCLIP_WAKE_ENV_MAX_BYTES) {
+    return json;
+  }
+  // Do not preserve arbitrary fields: descriptions, continuation history, and
+  // even identifier arrays can independently exceed the operating system limit.
+  // This is a retrieval notice, never a summary or certified history coverage.
+  return JSON.stringify({
+    version: 1,
+    truncated: true,
+    fallbackFetchNeeded: true,
+    transport: "run_context_reference",
+    retrieval: {
+      method: "GET",
+      path: "/api/heartbeat-runs/$PAPERCLIP_RUN_ID",
+      field: "contextSnapshot.paperclipWake",
+      instructions: "This environment copy is incomplete. Before acting, use the complete wake in the supplied prompt, or fetch the current run using PAPERCLIP_API_URL and PAPERCLIP_API_KEY (Bearer). Substitute PAPERCLIP_RUN_ID in the path; normalize the base URL to avoid a duplicate /api. Read contextSnapshot.paperclipWake and the run context. Preserve message authors, coverage, interaction outcomes, and completed actions. Do not replay completed actions. If neither source supplies the full context, stop and report the retrieval failure; do not infer missing history or authority.",
+    },
+  });
+}
+
 export function stringifyPaperclipWakePayload(
   value: unknown,
   options: {
@@ -4583,9 +4610,13 @@ export async function runChildProcess(
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
+    const launchEnv = { ...opts.env };
+    if (launchEnv.PAPERCLIP_WAKE_PAYLOAD_JSON) {
+      launchEnv.PAPERCLIP_WAKE_PAYLOAD_JSON = boundPaperclipWakePayloadEnv(launchEnv.PAPERCLIP_WAKE_PAYLOAD_JSON);
+    }
     const rawMerged: NodeJS.ProcessEnv = {
       ...sanitizeInheritedPaperclipEnv(process.env),
-      ...opts.env,
+      ...launchEnv,
     };
 
     // Strip Claude Code nesting-guard env vars so spawned `claude` processes
@@ -4609,7 +4640,7 @@ export async function runChildProcess(
     }
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
-      remoteEnv: opts.remoteExecution ? opts.env : null,
+      remoteEnv: opts.remoteExecution ? launchEnv : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {

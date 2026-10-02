@@ -261,3 +261,17 @@ describe("acpx identity split and launch environment", () => {
     });
   });
 });
+
+
+describe("bounded wake launch environment", () => {
+  it.each([true, false])("bounds contributed wakes before the sandbox boundary (host=%s)", (inheritHostEnvironment) => {
+    const huge = JSON.stringify({ messages: ["😀".repeat(100_000)] });
+    const launch = finalizeLaunchEnvironment({}, [{ scope: "session", env: { PAPERCLIP_WAKE_PAYLOAD_JSON: huge } }], {
+      acpxAgent: "codex", inheritHostEnvironment,
+      inheritedEnv: { PAPERCLIP_WAKE_PAYLOAD_JSON: huge },
+    });
+    const json = launch.env.PAPERCLIP_WAKE_PAYLOAD_JSON;
+    expect(Buffer.byteLength(`PAPERCLIP_WAKE_PAYLOAD_JSON=${json}\0`)).toBeLessThan(32 * 1024);
+    expect(JSON.parse(json)).toMatchObject({ truncated: true, fallbackFetchNeeded: true });
+  });
+});
