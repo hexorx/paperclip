@@ -48,6 +48,7 @@ import {
   selectPaperclipTaskMarkdown,
   isPaperclipRecoveryWakePayload,
   stringifyPaperclipWakePayload,
+  boundPaperclipWakePayloadEnv,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   joinPromptSections,
@@ -939,7 +940,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       env.PAPERCLIP_LINKED_ISSUE_IDS = linkedIssueIds.join(",");
     }
     if (wakePayloadJson) {
-      env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
+      env.PAPERCLIP_WAKE_PAYLOAD_JSON = boundPaperclipWakePayloadEnv(wakePayloadJson);
     }
     refreshPaperclipWorkspaceEnvForExecution({
       env,

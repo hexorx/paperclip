@@ -35,3 +35,29 @@ The invariant is pinned by the `no-remote-git contract` case in
 remote-only commit propagates to the local worktree through the
 prepare → restore round-trip with no git remote configured at any point. Do
 not regress that test.
+
+
+## Wake payload environment transport
+
+`stringifyPaperclipWakePayload` preserves the full normalized wake for prompts
+and API consumers. Adapters pass its environment copy through
+`boundPaperclipWakePayloadEnv`. The complete environment entry (key, equals,
+UTF-8 value, and NUL) is at most 32 KiB. Small values remain byte-for-byte intact.
+Large values become an explicit incomplete-context notice with
+`fallbackFetchNeeded: true`; this notice is not a summary or certified coverage.
+
+Before acting on an oversized wake, consume the complete prompt context or GET
+`/api/heartbeat-runs/$PAPERCLIP_RUN_ID` with the existing run bearer credential.
+Read `contextSnapshot.paperclipWake` and the accompanying run context. Normalize
+`PAPERCLIP_API_URL` before appending the API path. Preserve authors, coverage,
+completed actions, and interaction outcomes; never replay completed mutations.
+If access policy prevents retrieval and the prompt is incomplete, report the
+failure and stop instead of inferring missing authority or history. This does
+not grant additional access to run telemetry.
+
+The shared subprocess boundary bounds explicit environment overrides before
+remote/sandbox wrapping, and strips inherited Paperclip runtime variables. ACPX
+also bounds the final contributed environment before session launch. No payload
+file, shared mount, or credential-bearing command argument is introduced.
+This guards the wake entry; unrelated oversized environment entries or oversized
+command arguments remain subject to the operating system's own limits.

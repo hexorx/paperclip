@@ -10,7 +10,7 @@ import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
 } from "./local-process-sandbox.js";
-import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
+import { buildSshSpawnTarget, shellQuote, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
 import { paperclipChatFilePreparationDelivery } from "./chat-file-delivery.js";
 import {
@@ -1913,6 +1913,40 @@ export function normalizePaperclipWakePayload(
     truncated: asBoolean(payload.truncated, false),
     fallbackFetchNeeded: asBoolean(payload.fallbackFetchNeeded, false),
   };
+}
+
+// Includes the environment key, equals sign, and terminating NUL. Keep well
+// below Linux's per-string exec limit, including on small-page systems.
+export const PAPERCLIP_WAKE_ENV_MAX_BYTES = 32 * 1024;
+const PAPERCLIP_WAKE_ENV_OVERHEAD = Buffer.byteLength("PAPERCLIP_WAKE_PAYLOAD_JSON=") + 1;
+
+/** Bound only the environment transport. Prompt/API snapshots stay complete. */
+export function boundPaperclipWakePayloadEnv(json: string): string {
+  const entryBytes = Buffer.byteLength(json, "utf8") + PAPERCLIP_WAKE_ENV_OVERHEAD;
+  // SSH quotes the env value, then quotes the remote script containing it.
+  // Apostrophes can expand 17-fold across those two layers. Budget the actual
+  // encoding as well as the raw entry, leaving half of Linux's 128 KiB
+  // per-argument limit for the wrapper, command, and other environment entries.
+  // Apply this on every lane so a bounded value stays safe when later wrapped.
+  if (entryBytes <= PAPERCLIP_WAKE_ENV_MAX_BYTES
+    && Buffer.byteLength(shellQuote(shellQuote(json)), "utf8") + PAPERCLIP_WAKE_ENV_OVERHEAD <= 64 * 1024) {
+    return json;
+  }
+  // Do not preserve arbitrary fields: descriptions, continuation history, and
+  // even identifier arrays can independently exceed the operating system limit.
+  // This is a retrieval notice, never a summary or certified history coverage.
+  return JSON.stringify({
+    version: 1,
+    truncated: true,
+    fallbackFetchNeeded: true,
+    transport: "run_context_reference",
+    retrieval: {
+      method: "GET",
+      path: "/api/heartbeat-runs/$PAPERCLIP_RUN_ID",
+      field: "contextSnapshot.paperclipWake",
+      instructions: "This environment copy is incomplete. Before acting, use the complete wake in the supplied prompt, or fetch the current run using PAPERCLIP_API_URL and PAPERCLIP_API_KEY (Bearer). Substitute PAPERCLIP_RUN_ID in the path; normalize the base URL to avoid a duplicate /api. Read contextSnapshot.paperclipWake and the run context. Preserve message authors, coverage, interaction outcomes, and completed actions. Do not replay completed actions. If neither source supplies the full context, stop and report the retrieval failure; do not infer missing history or authority.",
+    },
+  });
 }
 
 export function stringifyPaperclipWakePayload(
@@ -4583,9 +4617,13 @@ export async function runChildProcess(
     opts.onLogError ??
     ((err, id, msg) => console.warn({ err, runId: id }, msg));
   return new Promise<RunProcessResult>((resolve, reject) => {
+    const launchEnv = { ...opts.env };
+    if (launchEnv.PAPERCLIP_WAKE_PAYLOAD_JSON) {
+      launchEnv.PAPERCLIP_WAKE_PAYLOAD_JSON = boundPaperclipWakePayloadEnv(launchEnv.PAPERCLIP_WAKE_PAYLOAD_JSON);
+    }
     const rawMerged: NodeJS.ProcessEnv = {
       ...sanitizeInheritedPaperclipEnv(process.env),
-      ...opts.env,
+      ...launchEnv,
     };
 
     // Strip Claude Code nesting-guard env vars so spawned `claude` processes
@@ -4609,7 +4647,7 @@ export async function runChildProcess(
     }
     void resolveSpawnTarget(command, args, opts.cwd, mergedEnv, {
       remoteExecution: opts.remoteExecution ?? null,
-      remoteEnv: opts.remoteExecution ? opts.env : null,
+      remoteEnv: opts.remoteExecution ? launchEnv : null,
       localProcessSandbox: opts.localProcessSandbox ?? null,
     })
       .then((target) => {

@@ -39,6 +39,7 @@ import {
   renderPaperclipWakePrompt,
   selectPaperclipTaskMarkdown,
   stringifyPaperclipWakePayload,
+  boundPaperclipWakePayloadEnv,
   isPaperclipRecoveryWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
 
@@ -510,7 +511,7 @@ export async function execute(
   const envCommentId = cfgString(ctxContext.commentId) || cfgString(ctxContext.wakeCommentId) || cfgString(ctx.config?.commentId);
   if (envCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = envCommentId;
   const wakePayloadJson = stringifyPaperclipWakePayload(ctxContext.paperclipWake);
-  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = wakePayloadJson;
+  if (wakePayloadJson) env.PAPERCLIP_WAKE_PAYLOAD_JSON = boundPaperclipWakePayloadEnv(wakePayloadJson);
 
   // ── Resolve working directory ──────────────────────────────────────────
   const cwd =

@@ -102,3 +102,15 @@ The native-session resumption Sentry assertions drain pending failure reports
 with the existing `waitForPendingRunFailureReports` helper. An unrelated database
 round trip did not await the background report and raced the spy assertion.
 This is test-only; runtime reporting and database schema are unchanged.
+
+
+## Wake environment transport (hex.3)
+
+Local adapters and Codex ACPX now limit the wake environment entry to 32 KiB
+including UTF-8 encoding and environment framing. Oversized entries explicitly
+require full prompt context or retrieval from the authenticated current-run API.
+Prompt serialization stays complete. Child launches bound explicit overrides
+before sandbox/remote wrapping and reject inherited wake state.
+There are no database changes. Rollback is the previous image digest and config.
+The operator must verify a separate test issue with at least 100 KB of thread
+history starts an actual agent run and retains complete context before acceptance.
