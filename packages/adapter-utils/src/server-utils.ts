@@ -10,7 +10,7 @@ import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
 } from "./local-process-sandbox.js";
-import { buildSshSpawnTarget, type SshRemoteExecutionSpec } from "./ssh.js";
+import { buildSshSpawnTarget, shellQuote, type SshRemoteExecutionSpec } from "./ssh.js";
 import { redactCommandText } from "./command-redaction.js";
 import { paperclipChatFilePreparationDelivery } from "./chat-file-delivery.js";
 import {
@@ -1922,7 +1922,14 @@ const PAPERCLIP_WAKE_ENV_OVERHEAD = Buffer.byteLength("PAPERCLIP_WAKE_PAYLOAD_JS
 
 /** Bound only the environment transport. Prompt/API snapshots stay complete. */
 export function boundPaperclipWakePayloadEnv(json: string): string {
-  if (Buffer.byteLength(json, "utf8") + PAPERCLIP_WAKE_ENV_OVERHEAD <= PAPERCLIP_WAKE_ENV_MAX_BYTES) {
+  const entryBytes = Buffer.byteLength(json, "utf8") + PAPERCLIP_WAKE_ENV_OVERHEAD;
+  // SSH quotes the env value, then quotes the remote script containing it.
+  // Apostrophes can expand 17-fold across those two layers. Budget the actual
+  // encoding as well as the raw entry, leaving half of Linux's 128 KiB
+  // per-argument limit for the wrapper, command, and other environment entries.
+  // Apply this on every lane so a bounded value stays safe when later wrapped.
+  if (entryBytes <= PAPERCLIP_WAKE_ENV_MAX_BYTES
+    && Buffer.byteLength(shellQuote(shellQuote(json)), "utf8") + PAPERCLIP_WAKE_ENV_OVERHEAD <= 64 * 1024) {
     return json;
   }
   // Do not preserve arbitrary fields: descriptions, continuation history, and

@@ -1,3 +1,5 @@
+import { spawnSync } from "node:child_process";
+import { buildSshSpawnTarget } from "./ssh.js";
 import { randomUUID } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -30,6 +32,37 @@ describe("wake environment transport", () => {
     expect(JSON.parse(bounded)).not.toHaveProperty("coverage");
     expect(boundPaperclipWakePayloadEnv(bounded)).toBe(bounded);
   });
+
+  it.each(["'".repeat(30_000), "'😀".repeat(6_500)])(
+    "starts a child with actual SSH arguments for quote-heavy wakes (%#)", async (body) => {
+      const full = JSON.stringify({ messages: [body] });
+      expect(entryBytes(full)).toBeLessThan(PAPERCLIP_WAKE_ENV_MAX_BYTES);
+      const build = (wake: string) => buildSshSpawnTarget({
+        spec: {
+          host: "ssh.example.test", port: 22, username: "ssh-user",
+          remoteCwd: "/srv/paperclip/workspace", remoteWorkspacePath: "/srv/paperclip/workspace",
+          privateKey: null, knownHosts: null, strictHostKeyChecking: true,
+        },
+        command: "node", args: ["--version"], env: { PAPERCLIP_WAKE_PAYLOAD_JSON: wake },
+      });
+      const original = await build(full);
+      const bounded = boundPaperclipWakePayloadEnv(full);
+      const target = await build(bounded);
+      try {
+        // Inspect and launch the actual generated arguments, without contacting
+        // an SSH host or inheriting the test runner's own wake environment.
+        expect(Buffer.byteLength(original.args.at(-1)!) + 1).toBeGreaterThan(128 * 1024);
+        expect(JSON.parse(bounded).fallbackFetchNeeded).toBe(true);
+        expect(Buffer.byteLength(target.args.at(-1)!) + 1).toBeLessThan(64 * 1024);
+        const child = spawnSync("/bin/true", target.args, { env: { PATH: process.env.PATH } });
+        expect(child.error).toBeUndefined();
+        expect(child.status).toBe(0);
+      } finally {
+        await original.cleanup();
+        await target.cleanup();
+      }
+    },
+  );
 
   it("counts UTF-8 bytes rather than JavaScript string length", () => {
     const json = JSON.stringify({ body: "😀".repeat(9_000) });
