@@ -1,6 +1,6 @@
 import { and, count, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, heartbeatRuns } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -92,6 +92,10 @@ export async function observeCrossIssueInfluence(
         agentId: heartbeatRuns.agentId,
         responsibleUserId: heartbeatRuns.responsibleUserId,
         contextSnapshot: heartbeatRuns.contextSnapshot,
+        invocationSource: heartbeatRuns.invocationSource,
+        triggerDetail: heartbeatRuns.triggerDetail,
+        status: heartbeatRuns.status,
+        wakeupRequestId: heartbeatRuns.wakeupRequestId,
       })
       .from(heartbeatRuns)
       .where(and(
@@ -110,10 +114,40 @@ export async function observeCrossIssueInfluence(
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    if (!sourceIssueId) {
+      // source/triggerDetail are accepted by the public wake API. Only a live
+      // run with a company/agent/run-bound scheduler receipt gets this scope.
+      // No source issue is invented: every write spends the shared budget.
+      if (
+        run.invocationSource !== "timer" ||
+        run.triggerDetail !== "system" ||
+        run.status !== "running" ||
+        !run.wakeupRequestId
+      ) {
+        throw crossIssueInfluenceRunContextError();
+      }
+      const schedulerWake = await tx
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(and(
+          eq(agentWakeupRequests.id, run.wakeupRequestId),
+          eq(agentWakeupRequests.companyId, input.companyId),
+          eq(agentWakeupRequests.agentId, input.agentId),
+          eq(agentWakeupRequests.runId, input.runId),
+          eq(agentWakeupRequests.source, "timer"),
+          eq(agentWakeupRequests.triggerDetail, "system"),
+          eq(agentWakeupRequests.reason, "heartbeat_timer"),
+          eq(agentWakeupRequests.requestedByActorType, "system"),
+          eq(agentWakeupRequests.requestedByActorId, "heartbeat_scheduler"),
+        ))
+        .then((rows) => rows[0] ?? null);
+      if (!schedulerWake) throw crossIssueInfluenceRunContextError();
+    }
     if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      sourceIssueId && (
+        sourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      )
     ) {
       return null;
     }
@@ -144,6 +178,7 @@ export async function observeCrossIssueInfluence(
       details: {
         kind: input.kind,
         sourceIssueId,
+        mutationScope: sourceIssueId ? "issue" : "scheduler_timer",
         targetIssueId: input.targetIssueId,
         targetIssueIdentifier: input.targetIssueIdentifier ?? null,
         count: decision.count,
