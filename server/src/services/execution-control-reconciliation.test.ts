@@ -17,6 +17,7 @@ vi.mock("../sentry.js", async () => {
 });
 
 import { reconcileAbandonedExecutionControl } from "./execution-control-reconciliation.js";
+import { waitForPendingRunFailureReports } from "./run-failure-report.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -31,6 +32,7 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
   }, 30_000);
 
   afterAll(async () => {
+    await waitForPendingRunFailureReports();
     await tempDb?.cleanup();
   });
 
@@ -79,6 +81,8 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
     const captureCallsBefore = mockCaptureRunFailure.mock.calls.length;
 
     const result = await reconcileAbandonedExecutionControl(db);
+    // Reconciliation starts reporting without awaiting the agent DB lookup.
+    await waitForPendingRunFailureReports();
 
     expect(result.surfaced).toBe(1);
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
@@ -96,7 +100,11 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
 
   it("reports zero events for a repeated sweep over the same already-failed run", async () => {
     const { runId } = await seedAbandonedRunFixture();
+    const firstCaptureCallsBefore = mockCaptureRunFailure.mock.calls.length;
     await reconcileAbandonedExecutionControl(db);
+    await waitForPendingRunFailureReports();
+    expect(mockCaptureRunFailure.mock.calls.slice(firstCaptureCallsBefore)).toHaveLength(1);
+    expect(mockCaptureRunFailure.mock.calls[firstCaptureCallsBefore]?.[0]).toMatchObject({ runId });
     // The first sweep already cleared executionControlDeadlineAt and moved the
     // run to "failed". Restore the deadline to simulate a second sweep still
     // observing the same run as a candidate.
@@ -107,6 +115,8 @@ describeEmbeddedPostgres("reconcileAbandonedExecutionControl reports a genuine f
 
     const captureCallsBefore = mockCaptureRunFailure.mock.calls.length;
     const result = await reconcileAbandonedExecutionControl(db);
+    // Reconciliation starts reporting without awaiting the agent DB lookup.
+    await waitForPendingRunFailureReports();
 
     // The run is already terminal ("failed"), so the early terminal-status
     // guard applies and no second "failed" write happens.
