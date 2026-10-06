@@ -142,7 +142,7 @@ test("old and new pnpm configuration both apply the exact runtime patches", () =
     providerPackBuilder,
     /copyFileSync\(process\.execPath, stableNodeCommand\)/,
   );
-  assert.match(codexPatch, /\+    "@openai\/codex": "0\.153\.4"/);
+  assert.match(codexPatch, /\+    "@openai\/codex": "0\.160\.0"/);
 });
 
 test("the ACPX patch preserves launch-only state and verified spawning", () => {
