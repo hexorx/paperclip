@@ -123,6 +123,21 @@ There are no database changes. Rollback is the previous image digest and config.
 The operator must verify a separate test issue with at least 100 KB of thread
 history starts an actual agent run and retains complete context before acceptance.
 
+
+## Taskless scheduler timer mutation scope
+
+A running taskless timer can comment, update issues, or resolve interactions only
+when its persisted wake receipt identifies the system heartbeat scheduler. The
+receipt must match the run, company, and agent and carry timer/system provenance
+and the heartbeat_timer reason. Agent-supplied timer labels do not qualify.
+Every mutation attempt spends the existing atomic per-run cross-issue budget,
+including repeated writes to one target. No source issue is synthesized.
+Route-specific authority, low-trust boundaries, interaction resolver policy,
+and checkout ownership still apply. Historical taskless runs without a matching
+scheduler receipt remain denied. Issue-scoped runs keep their existing behavior.
+No schema or data migration is needed. A future reviewed LAN rollout belongs to
+Ops; rollback is the previous source/image. This patch does not deploy anything.
+
 ## Security backports for the next release
 
 The focused security patch carries these upstream fixes from the stable base:

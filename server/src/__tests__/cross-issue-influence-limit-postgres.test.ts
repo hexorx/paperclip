@@ -3,6 +3,7 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   companies,
   createDb,
@@ -32,15 +33,17 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
   afterEach(async () => {
     await db.delete(activityLog);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(agents);
     await db.delete(companies);
   });
 
   afterAll(async () => {
+    await db.$client.end();
     await tempDb?.cleanup();
   });
 
-  it("allows exactly one of concurrent attempts 20 and 21", async () => {
+  it.each([false, true])("serializes mixed mutation kinds (taskless timer=%s)", async (timer) => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
@@ -63,13 +66,22 @@ describeEmbeddedPostgres("cross-issue influence limit PostgreSQL serialization",
       runtimeConfig: {},
       permissions: {},
     });
+    const wakeId = randomUUID();
+    if (timer) await db.insert(agentWakeupRequests).values({
+      id: wakeId, companyId, agentId, runId, source: "timer", triggerDetail: "system",
+      reason: "heartbeat_timer", requestedByActorType: "system",
+      requestedByActorId: "heartbeat_scheduler",
+    });
     await db.insert(heartbeatRuns).values({
       id: runId,
       companyId,
       agentId,
       status: "running",
       responsibleUserId: "board-user",
-      contextSnapshot: { issueId: sourceIssueId },
+      invocationSource: timer ? "timer" : "assignment",
+      triggerDetail: "system",
+      wakeupRequestId: timer ? wakeId : null,
+      contextSnapshot: timer ? {} : { issueId: sourceIssueId },
     });
     await db.insert(activityLog).values(
       Array.from({ length: 18 }, () => ({

@@ -155,7 +155,7 @@ describeEmbeddedPostgres("cross-issue interaction resolution cap (routes + postg
     await db.insert(companies).values({
       id: companyId,
       name: `${prefix} Company`,
-      issuePrefix: prefix,
+      issuePrefix: `${prefix}${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
     await db.insert(agents).values({
@@ -395,4 +395,117 @@ describeEmbeddedPostgres("cross-issue interaction resolution cap (routes + postg
       .where(eq(issueThreadInteractions.companyId, companyId));
     expect(answered.map((row) => row.status).sort()).toEqual(["answered", "pending"]);
   }, 30_000);
+
+  async function seedTimer(companyId: string, agentId: string) {
+    const runId = randomUUID();
+    const wakeId = randomUUID();
+    await db.insert(agentWakeupRequests).values({
+      id: wakeId, companyId, agentId, runId, source: "timer", triggerDetail: "system",
+      reason: "heartbeat_timer", requestedByActorType: "system",
+      requestedByActorId: "heartbeat_scheduler",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, invocationSource: "timer", triggerDetail: "system",
+      status: "running", wakeupRequestId: wakeId, contextSnapshot: {},
+    });
+    return { runId, wakeId };
+  }
+
+  it("allows timer comments and idle issue updates and spends one shared budget", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent("TMR");
+    const issueId = await seedIssue(companyId, "TMR", null);
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issueId));
+    const { runId } = await seedTimer(companyId, agentId);
+    const client = app(agentActor(companyId, agentId, runId));
+    const comment = await request(client).post(`/api/issues/${issueId}/comments`).send({ body: "Timer observation" });
+    expect(comment.status, JSON.stringify(comment.body)).toBe(201);
+    const update = await request(client).patch(`/api/issues/${issueId}`).send({ title: "Updated by timer" });
+    expect(update.status, JSON.stringify(update.body)).toBe(200);
+    expect(await countInfluenceRows(companyId, runId, "issue.cross_issue_influence_observed")).toBe(2);
+    await spendBudget(companyId, agentId, runId, 18);
+    const denied = await request(client).patch(`/api/issues/${issueId}`).send({ title: "Over budget" });
+    expect(denied.status, JSON.stringify(denied.body)).toBe(429);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue.title).toBe("Updated by timer");
+  }, 30_000);
+
+  it.each(["accept", "reject", "respond", "verdicts"] as const)(
+    "allows taskless timer %s resolution and denies it at cap", async (route) => {
+      const { companyId, agentId } = await seedCompanyAndAgent("TIR");
+      const issueId = await seedIssue(companyId, "TIR", agentId);
+      const { runId } = await seedTimer(companyId, agentId);
+      const id = await seedInteraction(companyId, issueId, route);
+      await db.update(issueThreadInteractions).set({ continuationPolicy: "none" }).where(eq(issueThreadInteractions.id, id));
+      const client = app(agentActor(companyId, agentId, runId));
+      const allowed = await request(client).post(`/api/issues/${issueId}/interactions/${id}/${route}`)
+        .send(INTERACTION_FIXTURES[route].body);
+      expect(allowed.status, JSON.stringify(allowed.body)).toBe(200);
+      await spendBudget(companyId, agentId, runId, 19);
+      const nextId = await seedInteraction(companyId, issueId, route);
+      const denied = await request(client).post(`/api/issues/${issueId}/interactions/${nextId}/${route}`)
+        .send(INTERACTION_FIXTURES[route].body);
+      expect(denied.status, JSON.stringify(denied.body)).toBe(429);
+      const [pending] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, nextId));
+      expect(pending).toMatchObject({ status: "pending", result: null });
+    }, 30_000,
+  );
+
+  it.each([
+    { requestedByActorType: "agent" }, { requestedByActorId: "not_scheduler" },
+    { runId: null }, { reason: "manual" }, { source: "on_demand" },
+    { triggerDetail: "manual" },
+  ])("rejects forged or unbound scheduler receipts: %j", async (override) => {
+    const { companyId, agentId } = await seedCompanyAndAgent("FRG");
+    const issueId = await seedIssue(companyId, "FRG", null);
+    const { runId, wakeId } = await seedTimer(companyId, agentId);
+    await db.update(agentWakeupRequests).set(override).where(eq(agentWakeupRequests.id, wakeId));
+    const response = await request(app(agentActor(companyId, agentId, runId)))
+      .post(`/api/issues/${issueId}/comments`).send({ body: "Must be denied" });
+    expect(response.status, JSON.stringify(response.body)).toBe(403);
+    expect(response.body.details.code).toBe("cross_issue_influence_run_context_required");
+    expect(await countInfluenceRows(companyId, runId, "issue.cross_issue_influence_observed")).toBe(0);
+  }, 30_000);
+
+  it("preserves active checkout ownership for timer updates", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent("LCK");
+    const issueId = await seedIssue(companyId, "LCK", agentId);
+    const lockRunId = await seedRun(companyId, agentId, issueId);
+    await db.update(issues).set({ checkoutRunId: lockRunId }).where(eq(issues.id, issueId));
+    const { runId } = await seedTimer(companyId, agentId);
+    const response = await request(app(agentActor(companyId, agentId, runId)))
+      .patch(`/api/issues/${issueId}`).send({ title: "Must stay locked" });
+    expect(response.status, JSON.stringify(response.body)).toBe(409);
+  }, 30_000);
+
+  it("preserves low-trust denials even for verified timers", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent("LTR");
+    const issueId = await seedIssue(companyId, "LTR", null);
+    const { runId } = await seedTimer(companyId, agentId);
+    await db.update(agents).set({ permissions: { trustPreset: "low_trust_review" } }).where(eq(agents.id, agentId));
+    const interactionId = await seedInteraction(companyId, issueId, "respond");
+    const client = app(agentActor(companyId, agentId, runId));
+    for (const response of [
+      await request(client).post(`/api/issues/${issueId}/comments`).send({ body: "Denied" }),
+      await request(client).patch(`/api/issues/${issueId}`).send({ title: "Denied" }),
+      await request(client).post(`/api/issues/${issueId}/interactions/${interactionId}/respond`).send(INTERACTION_FIXTURES.respond.body),
+    ]) expect(response.status, JSON.stringify(response.body)).toBe(403);
+    expect(await countInfluenceRows(companyId, runId, "issue.cross_issue_influence_observed")).toBe(0);
+  }, 30_000);
+
+
+  it.each(["company", "agent", "run"] as const)("rejects a scheduler receipt bound to another %s", async (binding) => {
+    const { companyId, agentId } = await seedCompanyAndAgent("BND");
+    const other = await seedCompanyAndAgent("OTH");
+    const issueId = await seedIssue(companyId, "BND", null);
+    const { runId, wakeId } = await seedTimer(companyId, agentId);
+    await db.update(agentWakeupRequests).set(
+      binding === "company" ? { companyId: other.companyId } :
+      binding === "agent" ? { agentId: other.agentId } : { runId: randomUUID() },
+    ).where(eq(agentWakeupRequests.id, wakeId));
+    const response = await request(app(agentActor(companyId, agentId, runId)))
+      .post(`/api/issues/${issueId}/comments`).send({ body: "Denied" });
+    expect(response.status, JSON.stringify(response.body)).toBe(403);
+    expect(await countInfluenceRows(companyId, runId, "issue.cross_issue_influence_observed")).toBe(0);
+  }, 30_000);
+
 });

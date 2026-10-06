@@ -10,6 +10,7 @@ import {
 function counterDb(
   initialCount = 0,
   runOverrides: Record<string, unknown> | null = {},
+  schedulerReceipt = false,
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
@@ -17,6 +18,10 @@ function counterDb(
     select: (selection: Record<string, unknown>) => ({
       from: () => ({
         where: () => {
+          if (Object.keys(selection).length === 1 && "id" in selection) {
+            return { then: (resolve: (rows: unknown[]) => unknown) =>
+              resolve(schedulerReceipt ? [{ id: "wake-1" }] : []) };
+          }
           if (Object.keys(selection).includes("count")) {
             return {
               then: (resolve: (rows: unknown[]) => unknown) => resolve([{ count: observedCount }]),
@@ -148,9 +153,9 @@ describe("cross-issue influence limit rollout", () => {
     ]);
   });
 
-  it("does not count same-issue writes", async () => {
+  it.each(["issueId", "taskId"])("does not count same-issue writes via %s", async (sourceKey) => {
     const fake = counterDb(0, {
-      contextSnapshot: { issueId: "55555555-5555-4555-8555-555555555555" },
+      contextSnapshot: { [sourceKey]: "55555555-5555-4555-8555-555555555555" },
     });
     await expect(observeCrossIssueInfluence(fake.db as never, {
       companyId: "22222222-2222-4222-8222-222222222222",
@@ -182,12 +187,12 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
-  it("fails closed before querying for a malformed run id", async () => {
+  it.each(["", "attacker-controlled-run-id"])("fails closed before querying for invalid run id %j", async (runId) => {
     const fake = counterDb();
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
       companyId: "22222222-2222-4222-8222-222222222222",
-      runId: "attacker-controlled-run-id",
+      runId,
       agentId: "33333333-3333-4333-8333-333333333333",
       targetIssueId: "55555555-5555-4555-8555-555555555555",
       kind: "comment",
@@ -211,6 +216,58 @@ describe("cross-issue influence limit rollout", () => {
       status: 403,
       details: { code: "cross_issue_influence_run_context_required" },
     });
+    expect(fake.inserted).toEqual([]);
+  });
+});
+
+const timerRun = {
+  contextSnapshot: {}, invocationSource: "timer", triggerDetail: "system",
+  status: "running", wakeupRequestId: "wake-1",
+};
+const timerInput = {
+  companyId: "22222222-2222-4222-8222-222222222222",
+  runId: "11111111-1111-4111-8111-111111111111",
+  agentId: "33333333-3333-4333-8333-333333333333",
+  targetIssueId: "55555555-5555-4555-8555-555555555555",
+  now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+};
+
+describe("taskless scheduler timer mutation budget", () => {
+  it("charges all three mutation kinds even when they target the same issue", async () => {
+    const fake = counterDb(0, timerRun, true);
+    for (const kind of ["comment", "update", "interaction_resolution"] as const) {
+      const expectedCount = fake.observedCount + 1;
+      await expect(observeCrossIssueInfluence(fake.db as never, { ...timerInput, kind }))
+        .resolves.toMatchObject({ allowed: true, count: expectedCount });
+    }
+    expect(fake.observedCount).toBe(3);
+    expect(fake.inserted[0].details).toMatchObject({ sourceIssueId: null, mutationScope: "scheduler_timer" });
+  });
+
+  it("enforces the shared cap for a scheduler timer", async () => {
+    const fake = counterDb(19, timerRun, true);
+    await expect(observeCrossIssueInfluence(fake.db as never, { ...timerInput, kind: "comment" }))
+      .resolves.toMatchObject({ allowed: true, count: 20 });
+    await expect(observeCrossIssueInfluence(fake.db as never, { ...timerInput, kind: "update" }))
+      .resolves.toMatchObject({ allowed: false, count: 21 });
+  });
+
+  it.each([
+    { status: "succeeded" }, { status: "queued" }, { invocationSource: "on_demand" },
+    { triggerDetail: "manual" }, { wakeupRequestId: null },
+    { companyId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+    { agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
+  ])("rejects ineligible taskless runs: %j", async (override) => {
+    const fake = counterDb(0, { ...timerRun, ...override }, true);
+    await expect(observeCrossIssueInfluence(fake.db as never, { ...timerInput, kind: "comment" }))
+      .rejects.toMatchObject({ status: 403 });
+    expect(fake.inserted).toEqual([]);
+  });
+
+  it("rejects a timer label without a verified scheduler receipt", async () => {
+    const fake = counterDb(0, timerRun);
+    await expect(observeCrossIssueInfluence(fake.db as never, { ...timerInput, kind: "comment" }))
+      .rejects.toMatchObject({ status: 403 });
     expect(fake.inserted).toEqual([]);
   });
 });
