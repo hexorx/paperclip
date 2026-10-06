@@ -681,7 +681,7 @@ function scopeAllowsTool(scope: Record<string, unknown> | null, ctx: ToolAccessC
         !values.every((value) => {
           if (typeof value !== "string") return false;
           const separator = value.indexOf(":");
-          return ["tool", "connection", "application"].includes(value.slice(0, separator)) &&
+          return separator > 0 && ["tool", "connection", "application"].includes(value.slice(0, separator)) &&
             value.slice(separator + 1).trim().length > 0;
         })) return false;
     if (!values.includes(`tool:${ctx.toolName}`) &&

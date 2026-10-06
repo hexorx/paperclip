@@ -26,6 +26,9 @@ suite("tool grant restrictions", () => {
     { name: "malformed allow list", scope: { allow: [42] }, allowed: false },
     { name: "unknown selector", scope: { unsupported: true }, allowed: false },
     { name: "matching allow with unknown entry", scope: { allow: ["tool:tool_0004", "unknown:tool_0004"] }, allowed: false },
+    { name: "matching allow with missing separator toolx", scope: { allow: ["tool:tool_0004", "toolx"] }, allowed: false },
+    { name: "matching allow with missing separator connectionx", scope: { allow: ["tool:tool_0004", "connectionx"] }, allowed: false },
+    { name: "matching allow with missing separator applicationx", scope: { allow: ["tool:tool_0004", "applicationx"] }, allowed: false },
     { name: "matching allow with empty target", scope: { allow: ["tool:tool_0004", "connection: "] }, allowed: false },
     { name: "unknown allow prefix", scope: { allow: ["anything:tool_0004"] }, allowed: false },
     { name: "malformed allow root", scope: { allow: 42 }, allowed: false },
@@ -57,6 +60,53 @@ suite("tool grant restrictions", () => {
     });
     expect(result.allowed).toBe(allowed);
   });
+
+  it.each(["tool", "connection", "application"])("allows ordinary %s grant entries", async (prefix) => {
+    const fixture = await createListingFixture(db, 6);
+    const target = prefix === "tool" ? "tool_0004"
+      : prefix === "connection" ? fixture.connection.id : fixture.application.id;
+    await db.update(principalPermissionGrants).set({ scope: { allow: [`${prefix}:${target}`] } })
+      .where(eq(principalPermissionGrants.principalId, fixture.agent.id));
+    const result = await toolAccessPolicyService(db).decide({
+      companyId: fixture.company.id,
+      actor: { actorType: "agent", actorId: fixture.agent.id, agentId: fixture.agent.id },
+      runContext: { heartbeatRunId: fixture.run.id },
+      request: { connectionId: fixture.connection.id, catalogEntryId: fixture.entries[4]!.id, toolName: "tool_0004" },
+    });
+    expect(result.allowed).toBe(true);
+  });
+
+  it.each(["toolx", "connectionx", "applicationx"])(
+    "hides mixed grants containing %s and denies HTTP calls before invoking the provider",
+    async (malformed) => {
+      const fixture = await createListingFixture(db, 6);
+      await db.update(toolProfiles).set({ defaultAction: "deny" }).where(eq(toolProfiles.id, fixture.namedGateway.profileId));
+      const providerMethods: string[] = [];
+      const service = createToolGatewayService(db, { remoteHttpRequest: async (_url, init) => {
+        const body = JSON.parse(String(init.body));
+        providerMethods.push(body.method);
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: body.id, result: body.method === "initialize"
+          ? { protocolVersion: "2025-03-26", capabilities: {}, serverInfo: { name: "fixture", version: "1" } }
+          : { content: [{ type: "text", text: "fixture result" }] } }), { headers: { "content-type": "application/json" } });
+      } });
+      const app = express().use(express.json()).use(mcpGatewayProtocolRoutes(service));
+      const post = (method: string, params?: unknown) => request(app)
+        .post(`/mcp/gateways/${fixture.namedGateway.gatewayPublicId}`)
+        .set("Authorization", `Bearer ${fixture.token.token}`).send({ jsonrpc: "2.0", id: 1, method, params });
+      await db.update(principalPermissionGrants).set({ scope: { allow: ["tool:tool_0004"] } })
+        .where(eq(principalPermissionGrants.principalId, fixture.agent.id));
+      const tools = await service.listToolsForNamedGateway({ gatewayId: fixture.namedGateway.id, bearerToken: fixture.token.token });
+      const toolName = tools.find((entry) => entry.catalogEntryId === fixture.entries[4]!.id)!.name;
+      const validListing = await post("tools/list").expect(200);
+      expect(validListing.body.result.tools.some((entry: { name: string }) => entry.name === toolName)).toBe(true);
+      await db.update(principalPermissionGrants).set({ scope: { allow: ["tool:tool_0004", malformed] } })
+        .where(eq(principalPermissionGrants.principalId, fixture.agent.id));
+      const listing = await post("tools/list").expect(200);
+      expect(listing.body.result.tools.some((entry: { name: string }) => entry.name === toolName)).toBe(false);
+      await post("tools/call", { name: toolName, arguments: {} }).expect(403);
+      expect(providerMethods).not.toContain("tools/call");
+    },
+  );
 
   it("lists and calls only granted tools through the HTTP gateway, then observes revocation", async () => {
     const fixture = await createListingFixture(db, 6);
