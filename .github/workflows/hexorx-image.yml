@@ -5,6 +5,12 @@ on:
     branches: [hexorx]
   push:
     branches: [hexorx]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Full 40-character commit SHA to publish; requires Josh approval before dispatch
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -19,9 +25,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
+      - name: Validate manual source
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          SOURCE_REF: ${{ inputs.ref }}
+        run: '[[ "$SOURCE_REF" =~ ^[0-9a-f]{40}$ ]]'
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: pnpm/action-setup@v6
         with:
@@ -30,6 +41,8 @@ jobs:
         with:
           node-version: 24
       - run: pnpm install --frozen-lockfile
+      - name: Test release publish gate
+        run: node --test scripts/hexorx-image.test.mjs
       # Root Vitest does not discover the runner node:test contracts.
       - name: Run runner node:test contracts
         run: node --test packages/paperclip-runner/test/*.test.mjs
@@ -46,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: pnpm/action-setup@v6
         with:
@@ -99,7 +112,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: pnpm/action-setup@v6
         with:
@@ -120,7 +133,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Read version
         id: version
@@ -138,10 +151,10 @@ jobs:
           push: false
           build-args: |
             PAPERCLIP_BUILD_VERSION=${{ steps.version.outputs.value }}
-            PAPERCLIP_BUILD_COMMIT=${{ github.event.pull_request.head.sha || github.sha }}
+            PAPERCLIP_BUILD_COMMIT=${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
 
   publish:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/hexorx' && github.repository == 'hexorx/paperclip'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/hexorx' && github.repository == 'hexorx/paperclip'
     needs: [verify, workspace, tests, image]
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -151,6 +164,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.ref }}
           persist-credentials: false
       - name: Read version
         id: version
@@ -161,6 +175,27 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse existing image tags
+        shell: bash
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_VERSION: ${{ steps.version.outputs.value }}
+          SOURCE_REF: ${{ inputs.ref }}
+        run: |
+          token="$(curl --fail --silent --show-error --user "$GHCR_USER:$GHCR_PASSWORD" \
+            'https://ghcr.io/token?service=ghcr.io&scope=repository:hexorx/paperclip:pull' | jq -er '.token')"
+          echo "::add-mask::$token"
+          for tag in "$IMAGE_VERSION" "sha-$SOURCE_REF"; do
+            status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+              --header "Authorization: Bearer $token" \
+              --header 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/hexorx/paperclip/manifests/$tag")"
+            if [[ "$status" != 404 ]]; then
+              echo "::error::Refusing to publish $tag: registry returned $status (only 404 permits a new tag)."
+              exit 1
+            fi
+          done
       - name: Publish reviewed production image
         id: publish
         uses: docker/build-push-action@v6
@@ -171,19 +206,20 @@ jobs:
           push: true
           tags: |
             ghcr.io/hexorx/paperclip:${{ steps.version.outputs.value }}
-            ghcr.io/hexorx/paperclip:sha-${{ github.sha }}
+            ghcr.io/hexorx/paperclip:sha-${{ inputs.ref }}
           labels: |
             org.opencontainers.image.source=https://github.com/hexorx/paperclip
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ inputs.ref }}
             org.opencontainers.image.version=${{ steps.version.outputs.value }}
           build-args: |
             PAPERCLIP_BUILD_VERSION=${{ steps.version.outputs.value }}
-            PAPERCLIP_BUILD_COMMIT=${{ github.sha }}
+            PAPERCLIP_BUILD_COMMIT=${{ inputs.ref }}
       - name: Record immutable image
         env:
+          SOURCE_REF: ${{ inputs.ref }}
           IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
           IMAGE_VERSION: ${{ steps.version.outputs.value }}
         run: |
           echo "Image: ghcr.io/hexorx/paperclip:$IMAGE_VERSION" >> "$GITHUB_STEP_SUMMARY"
           echo "Digest: ghcr.io/hexorx/paperclip@$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
-          echo "Source: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source: $SOURCE_REF" >> "$GITHUB_STEP_SUMMARY"
