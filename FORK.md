@@ -96,6 +96,14 @@ If the new upstream base changed the database schema, an image-only rollback
 may be unsafe: use the tested database/data restore plan, with owner approval
 for any operation that can discard new data. Do not delete retained backups.
 
+## Runner contract CI coverage
+
+The required `Hexorx release image` verify job runs
+`node --test packages/paperclip-runner/test/*.test.mjs` after its frozen-lockfile
+dependency install. These contracts use Node's test runner and are not discovered
+by the root Vitest suite. Contract failures also block the image job through its
+existing dependency on verify.
+
 ## CI regression test synchronization (hex.2)
 
 The native-session resumption Sentry assertions drain pending failure reports

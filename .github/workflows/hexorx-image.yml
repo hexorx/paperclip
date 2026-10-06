@@ -30,6 +30,9 @@ jobs:
         with:
           node-version: 24
       - run: pnpm install --frozen-lockfile
+      # Root Vitest does not discover the runner node:test contracts.
+      - name: Run runner node:test contracts
+        run: node --test packages/paperclip-runner/test/*.test.mjs
       # The upstream root Vitest project list does not include Hermes.
       - run: pnpm --filter @paperclipai/hermes-paperclip-adapter test
       - run: pnpm --filter @paperclipai/hermes-paperclip-adapter typecheck
