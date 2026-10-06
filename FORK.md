@@ -114,3 +114,65 @@ before sandbox/remote wrapping and reject inherited wake state.
 There are no database changes. Rollback is the previous image digest and config.
 The operator must verify a separate test issue with at least 100 KB of thread
 history starts an actual agent run and retains complete context before acceptance.
+
+## Security backports for the next release
+
+The focused security patch carries these upstream fixes from the stable base:
+
+- `483dbc88904672362563419e485a1c4b366db96b` (#14915): require a stored
+  grant allow match and every selector match; malformed restrictions deny access.
+- `c46e41e81c03cd3c8b64cf993615b604d7fe8c62` (#14914): validate native MCP
+  gateway ownership and immutable profile provenance; exclude historical native
+  assignments from managed gateway discovery and bind valid legacy null owners.
+- `3ff3b34e15255395e38ad03d0331e55b6c056061` (#13660): return a constant
+  malformed-JSON client error without sending parser input to error sinks.
+- `e18ed02a566dfa10db37ea70fd2bedabb784510c` (#13657): validate heartbeat
+  run UUID parameters before database lookup and document the 400 response.
+- `6f40e23536ad9f80c6379543acc22871380fdc25` (#14413): redact the four
+  Cloud credential and assertion headers in both self-hosted logger modes.
+
+The grant fixture is a reduced test-only port from #14915's prerequisite
+fixture. The allow-entry validator additionally rejects unknown prefixes and
+empty targets even when another entry matches, so malformed mixed allow lists
+also fail closed. Cloud redaction is adapted to the stable fork's logger tests; it does
+not import unrelated GitHub capability changes. No schema, migration or
+provider-default changes are included. Lifecycle fixes #14738 and #14773 are
+separate work and are not included in this security patch.
+
+### Release and rollback constraints
+
+The running hex.4 source was reconciled to open fork PR #4 at immutable head
+`5fb2d3e3d6df983271217e4ef4af1cda789cac91`. It adds Codex 0.160.0 to
+hex.3. The candidate security files are identical at that head and integration
+base `b8652016179e57ced12f8fe7131e057cf93c43f1`.
+
+The combined `release/2026.916.1-hex.5` feature branch merges PR #4 at
+`5fb2d3e3d6df983271217e4ef4af1cda789cac91` with security PR #6 at
+`47ca30d20ffe9b2b966f865cd83dcd0a29ae047a`. The only merge conflict was
+`.hexorx-version`, resolved to `2026.916.1-hex.5`. All security code and tests
+remain identical to PR #6, including the grant separator validation. All Codex
+code, package pins and lockfile changes remain identical to PR #4. The combined
+branch retains Hermes cancellation/event-gap, pause authorization and bounded
+wake safeguards. It excludes v2026.1001.0, migrations 0280–0283, provider-default
+changes, legacy Composio changes and lifecycle fixes #14738/#14773.
+
+Before a release or rollout, independently review the combined head and require
+full CI on that exact head. A security branch image built without PR #4 would
+downgrade the installed Codex runtime. Do not publish a replacement hex.3
+or hex.4 tag. Build with source/version arguments so health and OCI labels carry
+the exact revision. Verify the immutable running image and candidate digest
+before the operator rollout. Source matching alone does not establish a running
+image ID or registry digest.
+
+Stored grants with unknown or malformed restrictions now deny access. Review
+those grants before rollout; correct an intended restriction through the normal
+operator policy surface. Do not broaden grants to make a denied call pass.
+Null and empty-object scopes preserve their previous broad behavior.
+
+No deployment is part of this patch. For a later operator rollout, back up the
+current compose reference and verify the exact previous local hex.4 image is
+available before swapping images. Rollback uses that captured image reference;
+do not assume the published hex.3 image is equivalent to the live hex.4 build.
+There is no schema migration to reverse. Valid legacy native gateway owner
+bindings persist after rollback; inspect any authorization difference instead
+of clearing ownership. Rolling back also restores the earlier security behavior.
