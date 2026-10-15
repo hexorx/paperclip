@@ -1,6 +1,9 @@
 import { runIdentityContexts } from "@paperclipai/db";
 import { captureRunIdentity } from "./run-identity.js";
-import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
+import {
+  allowsStandingGitHubDelegation,
+  resolveManagedGitHubIdentitySelection,
+} from "./git-credentials.js";
 import { logger } from "../middleware/logger.js";
 import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -2643,7 +2646,7 @@ export function createToolGatewayService(
           {
             agentId: session.agentId,
             responsibleUserId: session.responsibleUserId,
-            allowStandingDelegation: false,
+            allowStandingDelegation: allowsStandingGitHubDelegation(session.agentId),
           },
         );
         if (!selected.grant)
@@ -2702,7 +2705,7 @@ export function createToolGatewayService(
               {
                 agentId: session.agentId,
                 responsibleUserId: session.responsibleUserId,
-                allowStandingDelegation: false,
+                allowStandingDelegation: allowsStandingGitHubDelegation(session.agentId),
                 excludeGrantId: original.id,
               },
             );
@@ -4322,7 +4325,7 @@ export function createToolGatewayService(
         : await resolveManagedGitHubIdentitySelection(db, session.companyId, {
             agentId: session.agentId,
             responsibleUserId: session.responsibleUserId,
-            allowStandingDelegation: false,
+            allowStandingDelegation: allowsStandingGitHubDelegation(session.agentId),
           });
       if (!selected.grant || selected.grant.connectionId !== connection.id) {
         throw new ToolGatewayHttpError(

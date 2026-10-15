@@ -199,3 +199,16 @@ do not assume the published hex.3 image is equivalent to the live hex.4 build.
 There is no schema migration to reverse. Valid legacy native gateway owner
 bindings persist after rollback; inspect any authorization difference instead
 of clearing ownership. Rolling back also restores the earlier security behavior.
+
+## Scoped standing GitHub delegation
+
+Automated runs (no responsible user) can use a personal GitHub grant only when
+both gates hold: the grant owner created a delegation to that agent through the
+board-only `POST /tool-connections/:id/grants/:grantId/delegations` route, and
+the agent ID is listed in `PAPERCLIP_GITHUB_STANDING_DELEGATION_AGENT_IDS`
+(comma-separated). The variable is unset by default, which keeps the upstream
+behavior: runtime callers never read delegations. Dedicated and personal grants
+still win over a delegation, and low-trust runs still cannot export credentials.
+
+No schema migration. Roll back by unsetting the variable and restarting, or by
+revoking the delegation; either one alone disables the path.
