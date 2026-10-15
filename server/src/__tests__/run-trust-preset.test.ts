@@ -42,6 +42,7 @@ vi.mock("../services/secrets.js", () => ({
   secretService: credentials.secretService,
 }));
 vi.mock("../services/git-credentials.js", () => ({
+  allowsStandingGitHubDelegation: () => false,
   resolveManagedGitHubCredential: credentials.resolveManagedGitHubCredential,
   buildGitAuthInvocation: () => ({ env: { GH_TOKEN: "test-export-sentinel" } }),
 }));

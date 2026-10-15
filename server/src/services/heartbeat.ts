@@ -164,6 +164,7 @@ import { incrementToolRuntimeMetricCounter } from "./tool-runtime-metrics.js";
 import { logger } from "../middleware/logger.js";
 import {
   createGitRemoteAuthProvider,
+  allowsStandingGitHubDelegation,
   resolveManagedGitHubIdentitySelection,
   describeGitAuthFailure,
   filterResolvedGitHubConnectionsForRun,
@@ -20911,7 +20912,7 @@ export function heartbeatService(
         {
           agentId: agent.id,
           responsibleUserId,
-          allowStandingDelegation: false,
+          allowStandingDelegation: allowsStandingGitHubDelegation(agent.id),
         },
       );
       const useHostGitHub =

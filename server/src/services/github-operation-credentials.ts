@@ -11,6 +11,7 @@ import {
 import { forbidden } from "../errors.js";
 import { captureRunIdentity } from "./run-identity.js";
 import {
+  allowsStandingGitHubDelegation,
   buildGitAuthInvocation,
   resolveManagedGitHubCredential,
 } from "./git-credentials.js";
@@ -145,7 +146,7 @@ export async function resolveGitHubOperationCredentials(
       {
         agentId: input.agentId,
         heartbeatRunId: input.runId,
-        allowStandingDelegation: false,
+        allowStandingDelegation: allowsStandingGitHubDelegation(input.agentId),
         responsibleUserId:
           context?.cause === "company_default"
             ? null

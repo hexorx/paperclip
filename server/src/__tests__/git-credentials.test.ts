@@ -6,11 +6,14 @@ import { describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
 import {
   DEFAULT_GITHUB_TOKEN_SECRET_NAMES,
+  GITHUB_STANDING_DELEGATION_AGENT_IDS_ENV,
   GIT_CREDENTIAL_TOKEN_ENV_KEY,
+  allowsStandingGitHubDelegation,
   buildGitAuthInvocation,
   createGitRemoteAuthProvider,
   describeGitAuthFailure,
   isGitHubHttpsRemoteUrl,
+  resolveManagedGitHubIdentitySelection,
   scrubGitCredentialText,
 } from "../services/git-credentials.ts";
 
@@ -355,5 +358,93 @@ describe("DEFAULT_GITHUB_TOKEN_SECRET_NAMES", () => {
       "GH_TOKEN",
       "PAPERCLIP_GITHUB_TOKEN",
     ]);
+  });
+});
+
+describe("allowsStandingGitHubDelegation", () => {
+  it("is off when the allowlist is unset or empty", () => {
+    expect(allowsStandingGitHubDelegation("agent-codi", {})).toBe(false);
+    expect(allowsStandingGitHubDelegation("agent-codi", { [GITHUB_STANDING_DELEGATION_AGENT_IDS_ENV]: " , " })).toBe(false);
+  });
+
+  it("allows only agents named in the allowlist", () => {
+    const env = { [GITHUB_STANDING_DELEGATION_AGENT_IDS_ENV]: " agent-codi , agent-other " };
+    expect(allowsStandingGitHubDelegation("agent-codi", env)).toBe(true);
+    expect(allowsStandingGitHubDelegation("agent-other", env)).toBe(true);
+    expect(allowsStandingGitHubDelegation("agent-opi", env)).toBe(false);
+    expect(allowsStandingGitHubDelegation(null, env)).toBe(false);
+    expect(allowsStandingGitHubDelegation("", env)).toBe(false);
+  });
+});
+
+describe("resolveManagedGitHubIdentitySelection standing delegation", () => {
+  const personalGrant = {
+    id: "grant-mindi-dev",
+    companyId: "company-1",
+    connectionId: "github-connection",
+    kind: "user",
+    subjectUserId: "user-josh",
+    subjectAgentId: null,
+    status: "active",
+    createdAt: new Date("2026-10-01T00:00:00Z"),
+    credentialSecretRefs: [],
+    providerTenant: { github: { userId: "264486419" } },
+  };
+  const buildDb = (delegatedAgentIds: string[]) => {
+    const query = (rows: unknown[]) => ({
+      from: () => ({ where: async () => rows }),
+    });
+    return {
+      select: vi.fn()
+        .mockReturnValueOnce(query([{
+          id: "github-connection",
+          companyId: "company-1",
+          enabled: true,
+          status: "active",
+          config: { sourceTemplateKey: "github" },
+        }]))
+        .mockReturnValueOnce(query([{
+          connectionId: "github-connection",
+          companyId: "company-1",
+          targetType: "company",
+          targetId: "company-1",
+        }]))
+        .mockReturnValueOnce(query([personalGrant]))
+        .mockReturnValueOnce(query(delegatedAgentIds.map(() => ({ grantId: personalGrant.id })))),
+    } as unknown as Db;
+  };
+
+  it("keeps ownerless runs without an identity when standing delegation is off", async () => {
+    const db = buildDb(["agent-codi"]);
+    const selection = await resolveManagedGitHubIdentitySelection(db, "company-1", {
+      agentId: "agent-codi",
+      responsibleUserId: null,
+      allowStandingDelegation: false,
+    });
+    expect(selection.grant).toBeUndefined();
+    expect(selection.error).toBe("No managed GitHub identity is available for this run");
+    expect(db.select).toHaveBeenCalledTimes(3);
+  });
+
+  it("selects the delegated personal grant for an allowlisted ownerless run", async () => {
+    const db = buildDb(["agent-codi"]);
+    const selection = await resolveManagedGitHubIdentitySelection(db, "company-1", {
+      agentId: "agent-codi",
+      responsibleUserId: null,
+      allowStandingDelegation: true,
+    });
+    expect(selection.grant?.id).toBe(personalGrant.id);
+    expect(selection.identitySource).toBe("personal");
+  });
+
+  it("does not select the grant when the agent has no delegation row", async () => {
+    const db = buildDb([]);
+    const selection = await resolveManagedGitHubIdentitySelection(db, "company-1", {
+      agentId: "agent-codi",
+      responsibleUserId: null,
+      allowStandingDelegation: true,
+    });
+    expect(selection.grant).toBeUndefined();
+    expect(selection.error).toBe("No managed GitHub identity is available for this run");
   });
 });

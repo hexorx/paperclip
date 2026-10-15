@@ -293,6 +293,23 @@ export function createGitRemoteAuthProvider(
   };
 }
 
+export const GITHUB_STANDING_DELEGATION_AGENT_IDS_ENV = "PAPERCLIP_GITHUB_STANDING_DELEGATION_AGENT_IDS";
+
+// Standing delegation lets an ownerless (automated) run use a personal grant
+// its owner delegated to the agent. It stays off unless the operator names the
+// agent here; the board-created delegation row is still required per agent.
+export function allowsStandingGitHubDelegation(
+  agentId: string | null | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (!agentId) return false;
+  const allowed = (env[GITHUB_STANDING_DELEGATION_AGENT_IDS_ENV] ?? "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  return allowed.includes(agentId);
+}
+
 export async function resolveManagedGitHubIdentitySelection(
   db: Db,
   companyId: string,
@@ -453,6 +470,7 @@ export async function filterResolvedGitHubConnectionsForRun<T extends {
   const selection = await resolveManagedGitHubIdentitySelection(input.db, input.companyId, {
     agentId: input.agentId,
     responsibleUserId: input.responsibleUserId ?? null,
+    allowStandingDelegation: allowsStandingGitHubDelegation(input.agentId),
   });
   const selectedConnectionId = selection.grant?.connectionId ?? null;
   const githubIds = new Set(githubConnections.map((connection) => connection.id));
